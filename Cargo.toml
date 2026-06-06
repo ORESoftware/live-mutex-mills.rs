@@ -1,0 +1,14 @@
+[package]
+name = "live_mutex_mills"
+version = "0.1.0"
+edition = "2021"
+description = "A leaderless quorum/vote distributed mutual-exclusion protocol — a Paxos/Raft alternative specialized for locking."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Intentionally zero dependencies: the protocol core is pure logic + an
+# in-memory simulator, so it can be model-checked and ported anywhere.
+
+[[example]]
+name = "contention"
+path = "examples/contention.rs"
