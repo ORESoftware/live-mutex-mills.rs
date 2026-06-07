@@ -51,7 +51,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+pub mod codec;
 pub mod sim;
+pub mod transport;
 
 /// Identifier of a node in the cluster.
 pub type NodeId = u32;
@@ -61,6 +63,18 @@ pub type LockId = String;
 pub type Lamport = u64;
 /// A fence token: strictly increases across successive holders of one lock.
 pub type Fence = u64;
+/// A point in physical time, in arbitrary monotonic units (e.g. milliseconds).
+/// The protocol never reads a clock itself — callers pass `now` in. Time is
+/// used *only* for lease expiry on the failure path; the happy path is
+/// clock-free.
+pub type Instant = u64;
+
+/// How long a granted vote stays valid without a renewal. If a holder stops
+/// renewing (crash/partition) its votes are reclaimed after this long.
+pub const LEASE: Instant = 10_000;
+/// How often a requester renews the votes it currently holds. Must be
+/// comfortably smaller than [`LEASE`] so a few lost renewals are survivable.
+pub const RENEW_INTERVAL: Instant = 2_000;
 
 /// A globally unique, totally ordered request identifier.
 ///
@@ -95,6 +109,13 @@ pub enum Message {
     /// Requester → arbiters: "done, free your vote." Carries the token so the
     /// arbiter bumps its fence *before* granting the next holder.
     Release { lock: LockId, req: RequestId, fence: Fence },
+    /// Requester → arbiters: "I'm still alive, extend my vote's lease." Sent
+    /// periodically while a requester holds (or is collecting) votes.
+    Renew { lock: LockId, req: RequestId },
+    /// Arbiter → requester: "your lease lapsed and I've given the vote away."
+    /// Lets a slow-but-alive holder learn it has lost the lock so it can stop
+    /// using the resource (the fence token is the hard backstop regardless).
+    Revoked { lock: LockId, req: RequestId },
 }
 
 /// An outgoing message addressed to a node. The transport (or [`sim`]) decides
@@ -119,6 +140,9 @@ struct ArbiterState {
     queue: BTreeSet<RequestId>,
     /// Highest fence token this arbiter has acknowledged for the lock.
     fence_max: Fence,
+    /// Deadline by which the current votee must renew, else its vote is
+    /// reclaimed. Meaningful only while `voted_for` is `Some`.
+    lease: Instant,
 }
 
 /// Per-lock state when this node acts as a **requester** (wants the lock).
@@ -131,6 +155,8 @@ struct RequesterState {
     /// chosen token (`max + 1`).
     best_fence: Fence,
     locked: bool,
+    /// Next time this requester should renew the votes it holds.
+    next_renew: Instant,
 }
 
 /// A single node's protocol state machine. Pure logic — no I/O, no clocks.
@@ -148,6 +174,9 @@ pub struct Node {
     requester: HashMap<LockId, RequesterState>,
     outbox: Vec<Outgoing>,
     acquired: Vec<(LockId, Fence)>,
+    lost: Vec<LockId>,
+    /// Most recent time fed in by the caller (via `handle`/`tick`/etc.).
+    now: Instant,
 }
 
 impl Node {
@@ -164,6 +193,8 @@ impl Node {
             requester: HashMap::new(),
             outbox: Vec::new(),
             acquired: Vec::new(),
+            lost: Vec::new(),
+            now: 0,
         }
     }
 
@@ -176,8 +207,9 @@ impl Node {
     /// (including self). The lock is held once [`Node::take_acquired`] reports
     /// it. Re-requesting a lock already being acquired/held replaces the
     /// in-flight request.
-    pub fn request(&mut self, lock: &str) {
-        let ts = self.tick();
+    pub fn request(&mut self, now: Instant, lock: &str) {
+        self.now = now;
+        let ts = self.lamport_tick();
         let req = RequestId { ts, node: self.id };
         self.requester.insert(
             lock.to_string(),
@@ -186,6 +218,7 @@ impl Node {
                 votes: HashSet::new(),
                 best_fence: 0,
                 locked: false,
+                next_renew: now + RENEW_INTERVAL,
             },
         );
         for m in self.members.clone() {
@@ -196,7 +229,8 @@ impl Node {
     /// Release a held (or in-flight) lock, freeing votes at every arbiter that
     /// granted to it. The current fence token rides along so arbiters record it
     /// before handing the lock to the next holder.
-    pub fn release(&mut self, lock: &str) {
+    pub fn release(&mut self, now: Instant, lock: &str) {
+        self.now = now;
         if let Some(state) = self.requester.remove(lock) {
             let fence = state.best_fence;
             for m in self.members.clone() {
@@ -208,8 +242,10 @@ impl Node {
         }
     }
 
-    /// Feed an inbound message. `from` is the node that sent it.
-    pub fn handle(&mut self, from: NodeId, msg: Message) {
+    /// Feed an inbound message. `from` is the node that sent it; `now` is the
+    /// caller's current time.
+    pub fn handle(&mut self, now: Instant, from: NodeId, msg: Message) {
+        self.now = now;
         match msg {
             Message::Request { lock, req } => self.on_request(lock, req),
             Message::Grant { lock, req, fence } => self.on_grant(from, lock, req, fence),
@@ -217,6 +253,43 @@ impl Node {
             Message::Yield { lock, req } => self.on_yield(lock, req),
             Message::Confirm { lock, req, fence } => self.on_confirm(lock, req, fence),
             Message::Release { lock, req, fence } => self.on_release(lock, req, fence),
+            Message::Renew { lock, req } => self.on_renew(lock, req),
+            Message::Revoked { lock, req } => self.on_revoked(from, lock, req),
+        }
+    }
+
+    /// Advance time. Drives lease maintenance: reclaims votes whose holders
+    /// stopped renewing, and emits renewals for votes this node still holds.
+    /// Call periodically (the transport ties this to a wall clock).
+    pub fn tick(&mut self, now: Instant) {
+        self.now = now;
+
+        // Arbiter role: reclaim any votee whose lease has lapsed.
+        let mut grants: Vec<(LockId, (NodeId, RequestId, Fence))> = Vec::new();
+        for (lock, a) in self.arbiter.iter_mut() {
+            if a.voted_for.is_some() && now >= a.lease {
+                a.inquired = false;
+                if let Some(g) = Self::grant_next(a, now) {
+                    grants.push((lock.clone(), g));
+                }
+            }
+        }
+        for (lock, (to, r, fence)) in grants {
+            self.send(to, Message::Grant { lock, req: r, fence });
+        }
+
+        // Requester role: renew the votes we currently hold.
+        let mut renews: Vec<(NodeId, LockId, RequestId)> = Vec::new();
+        for (lock, r) in self.requester.iter_mut() {
+            if !r.votes.is_empty() && now >= r.next_renew {
+                r.next_renew = now + RENEW_INTERVAL;
+                for &v in r.votes.iter() {
+                    renews.push((v, lock.clone(), r.req));
+                }
+            }
+        }
+        for (to, lock, req) in renews {
+            self.send(to, Message::Renew { lock, req });
         }
     }
 
@@ -231,9 +304,16 @@ impl Node {
         std::mem::take(&mut self.acquired)
     }
 
+    /// Take the locks this node has *lost* since the last call (its lease
+    /// lapsed and another holder took over). The application must stop using
+    /// the resource for these locks.
+    pub fn take_lost(&mut self) -> Vec<LockId> {
+        std::mem::take(&mut self.lost)
+    }
+
     // ---- internals -------------------------------------------------------
 
-    fn tick(&mut self) -> Lamport {
+    fn lamport_tick(&mut self) -> Lamport {
         self.lamport += 1;
         self.lamport
     }
@@ -252,6 +332,7 @@ impl Node {
 
     fn on_request(&mut self, lock: LockId, req: RequestId) {
         self.observe(req.ts);
+        let now = self.now;
         let mut grant: Option<(NodeId, Fence)> = None;
         let mut inquire: Option<RequestId> = None;
         {
@@ -260,6 +341,7 @@ impl Node {
                 None => {
                     // Free: grant immediately to the requester.
                     a.voted_for = Some(req);
+                    a.lease = now + LEASE;
                     grant = Some((req.node, a.fence_max));
                 }
                 Some(current) => {
@@ -284,13 +366,14 @@ impl Node {
     }
 
     /// Grant the vote to the smallest waiting request, if any. Updates
-    /// `voted_for` (to the chosen request, or `None` if the queue is empty) and
-    /// returns the `Grant` to send.
-    fn grant_next(a: &mut ArbiterState) -> Option<(NodeId, RequestId, Fence)> {
+    /// `voted_for` (to the chosen request, or `None` if the queue is empty),
+    /// arms a fresh lease, and returns the `Grant` to send.
+    fn grant_next(a: &mut ArbiterState, now: Instant) -> Option<(NodeId, RequestId, Fence)> {
         match a.queue.iter().next().copied() {
             Some(next) => {
                 a.queue.remove(&next);
                 a.voted_for = Some(next);
+                a.lease = now + LEASE;
                 Some((next.node, next, a.fence_max))
             }
             None => {
@@ -301,6 +384,7 @@ impl Node {
     }
 
     fn on_yield(&mut self, lock: LockId, req: RequestId) {
+        let now = self.now;
         let mut grant: Option<(NodeId, RequestId, Fence)> = None;
         if let Some(a) = self.arbiter.get_mut(&lock) {
             if a.voted_for != Some(req) {
@@ -309,7 +393,7 @@ impl Node {
             // The yielder rejoins the queue; grant to whoever is now smallest.
             a.queue.insert(req);
             a.inquired = false;
-            grant = Self::grant_next(a);
+            grant = Self::grant_next(a, now);
         }
         if let Some((to, r, fence)) = grant {
             self.send(to, Message::Grant { lock, req: r, fence });
@@ -324,6 +408,7 @@ impl Node {
     }
 
     fn on_release(&mut self, lock: LockId, req: RequestId, fence: Fence) {
+        let now = self.now;
         let mut grant: Option<(NodeId, RequestId, Fence)> = None;
         if let Some(a) = self.arbiter.get_mut(&lock) {
             // Record the departing holder's token BEFORE granting next, so the
@@ -341,7 +426,7 @@ impl Node {
                 return; // not the current votee; queue eviction was enough
             }
             a.inquired = false;
-            grant = Self::grant_next(a);
+            grant = Self::grant_next(a, now);
         }
         if let Some((to, r, fence)) = grant {
             self.send(to, Message::Grant { lock, req: r, fence });
@@ -407,6 +492,47 @@ impl Node {
         }
         if do_yield {
             self.send(from, Message::Yield { lock, req });
+        }
+    }
+
+    // ---- lease maintenance ----------------------------------------------
+
+    /// Arbiter: extend the current votee's lease, or tell a stale requester it
+    /// has lost the vote.
+    fn on_renew(&mut self, lock: LockId, req: RequestId) {
+        let now = self.now;
+        let mut revoke = false;
+        if let Some(a) = self.arbiter.get_mut(&lock) {
+            if a.voted_for == Some(req) {
+                a.lease = now + LEASE;
+            } else {
+                revoke = true;
+            }
+        } else {
+            revoke = true;
+        }
+        if revoke {
+            self.send(req.node, Message::Revoked { lock, req });
+        }
+    }
+
+    /// Requester: an arbiter reclaimed our vote. Drop it; if that drops us below
+    /// quorum while we believed we held the lock, we have lost it.
+    fn on_revoked(&mut self, from: NodeId, lock: LockId, req: RequestId) {
+        let quorum = self.quorum;
+        let mut lost = false;
+        if let Some(r) = self.requester.get_mut(&lock) {
+            if r.req != req {
+                return;
+            }
+            r.votes.remove(&from);
+            if r.locked && r.votes.len() < quorum {
+                r.locked = false;
+                lost = true;
+            }
+        }
+        if lost {
+            self.lost.push(lock);
         }
     }
 }

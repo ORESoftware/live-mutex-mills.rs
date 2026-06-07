@@ -38,30 +38,57 @@ a quorum. The in-memory simulator (`src/sim.rs`) models this honestly: it keeps
 one FIFO queue per directed link and interleaves links/locks randomly, but never
 reorders within a link.
 
-## What's here (v1)
+## What's here
 
 - `src/lib.rs` — the transport-agnostic [`Node`] state machine. Pure logic, no
-  I/O, no clocks. Feed it messages with `handle`, drain sends with
-  `drain_outbox`, learn of acquisitions with `take_acquired`.
-- `src/sim.rs` — a deterministic, seedable FIFO network simulator.
-- `tests/mutual_exclusion.rs` — property tests asserting, across hundreds of
-  randomized interleavings: **never two holders**, **everyone eventually
-  acquires**, **fence tokens strictly increase**.
+  I/O. It never reads a clock; callers pass `now` in, and time is used *only*
+  for lease expiry on the failure path. Feed it messages with `handle`, advance
+  time with `tick`, drain sends with `drain_outbox`, learn of acquisitions with
+  `take_acquired` and of lost locks with `take_lost`.
+- `src/sim.rs` — a deterministic, seedable FIFO network simulator with
+  `crash()` and `advance()` for exercising holder failure.
+- `src/codec.rs` — a dependency-free line codec for the wire.
+- `src/transport.rs` + `src/bin/lmxd.rs` — a real **TCP transport** and node
+  daemon. One TCP connection per directed link (= FIFO), single-threaded driver
+  owning the `Node`, wall-clock-driven leases.
+- `tests/` — property tests over randomized FIFO interleavings (mutual
+  exclusion, progress, monotonic fencing), holder-failover recovery, codec
+  round-trips, and a 3-node end-to-end test over real loopback TCP.
 - `examples/contention.rs` — `cargo run --example contention`.
 
 ```
-cargo test                       # safety / progress / fencing properties
+cargo test                       # all properties + failover + TCP smoke
 cargo run --example contention   # watch 9 nodes hand a lock around
 ```
 
-## Not yet implemented (roadmap)
+### Running a real cluster
 
-- **Vote leases + holder-failure recovery.** Today a crashed holder's votes are
-  held forever. Real deployment needs a lease so votes are reclaimed on failure
-  — with fencing tokens covering the reclaim race against a partitioned holder.
-  This is the one place physical time re-enters, and only on the failure path.
-- **Real networking.** A TCP transport binding the `Node` state machine to
-  sockets (the FIFO requirement above is why TCP, not UDP).
+Start one process per node; `my_id` indexes the address list:
+
+```
+lmxd 0 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+lmxd 1 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+lmxd 2 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+```
+
+Then type `acquire <lock>` / `release <lock>` / `quit` on any node's stdin; it
+prints `ACQUIRED <lock> fence=<n>` when the lock is held. Crash a holder
+(`Ctrl-C`) and a survivor takes over once the lease lapses, with a higher fence.
+
+## Known limitation: token durability window
+
+A fence token only becomes *durable* once its `Confirm` reaches a quorum. A
+holder that **crashes in the narrow window between locking and that `Confirm`
+landing** can have its token reused by the next holder. The fix is to wait for a
+quorum of `Confirm` acks before reporting the lock acquired (one extra round
+trip); v1 reports immediately and accepts the window. Outside that window,
+failover fencing is strictly monotonic (see `tests/failover.rs`).
+
+## Roadmap
+
+- **Confirm-ack before use** — close the token-durability window above.
+- **Reconnect/buffering hardening** — the transport redials on startup but a
+  mid-run connection drop currently relies on leases; add active reconnect.
 - **Dynamic membership.** Quorum is `floor(n/2)+1` of a *fixed* member set.
   Changing membership safely needs one-at-a-time reconfiguration (so old and new
   quorums always overlap).
@@ -70,6 +97,12 @@ cargo run --example contention   # watch 9 nodes hand a lock around
   delicate intersection structure.
 - **Model checking.** The preemption/eviction logic is the subtle part; a TLA+
   or `loom`-style exhaustive check of the safety invariant would be worthwhile.
+
+## Done
+
+- ✅ Quorum/vote core with timestamp preemption (deadlock-free) and fencing.
+- ✅ Vote leases + holder-failure recovery (physical time, failure path only).
+- ✅ TCP transport + `lmxd` daemon, verified across processes.
 
 ## Design provenance
 
