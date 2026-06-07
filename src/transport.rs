@@ -104,12 +104,34 @@ pub fn run_node_with_codec(
         thread::spawn(move || loop {
             match TcpStream::connect(&addr) {
                 Ok(mut s) => {
-                    if writeln!(s, "HELLO {id} {}", codec.as_str()).is_ok()
-                        && ev_tx.send(Ev::Conn(peer, s)).is_ok()
-                    {
-                        return;
+                    if writeln!(s, "HELLO {id} {}", codec.as_str()).is_err() {
+                        thread::sleep(Duration::from_millis(150));
+                        continue;
                     }
-                    return;
+                    // Keep a read handle so we can notice when the peer closes
+                    // this link (e.g. a Kubernetes rolling restart) and re-dial.
+                    // The dialed socket is write-only for us, so this reader just
+                    // blocks until EOF. Without this the mesh never re-forms
+                    // after a peer restarts and consensus wedges.
+                    let monitor = match s.try_clone() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(150));
+                            continue;
+                        }
+                    };
+                    if ev_tx.send(Ev::Conn(peer, s)).is_err() {
+                        return; // event loop is gone
+                    }
+                    let mut r = BufReader::new(monitor);
+                    let mut sink = String::new();
+                    loop {
+                        sink.clear();
+                        match r.read_line(&mut sink) {
+                            Ok(0) | Err(_) => break, // peer closed; reconnect
+                            Ok(_) => {}
+                        }
+                    }
                 }
                 Err(_) => thread::sleep(Duration::from_millis(150)),
             }
