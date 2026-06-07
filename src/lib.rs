@@ -51,7 +51,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 pub mod codec;
+pub mod composite;
 pub mod sim;
 pub mod transport;
 
@@ -82,22 +85,27 @@ pub const RENEW_INTERVAL: Instant = 2_000;
 /// in declaration order, so a smaller Lamport timestamp wins and the node id
 /// breaks ties. This total order is what makes the preemption protocol
 /// deadlock- and starvation-free.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct RequestId {
     pub ts: Lamport,
     pub node: NodeId,
 }
 
 /// A protocol message. Every message names the lock it concerns; the *sender*
-/// is supplied out-of-band to [`Node::handle`] (it is `req.node` for a
-/// `Request`, and the arbiter's id for a `Grant`/`Inquire`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// is supplied out-of-band to [`Node::handle`]. Requester-to-arbiter messages
+/// must come from `req.node`; arbiter-to-requester messages must be addressed
+/// to the local node's request id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Requester → all arbiters: "please vote for me."
     Request { lock: LockId, req: RequestId },
     /// Arbiter → requester: "you have my vote." Carries the arbiter's highest
     /// fence token so the requester can compute a strictly-greater one.
-    Grant { lock: LockId, req: RequestId, fence: Fence },
+    Grant {
+        lock: LockId,
+        req: RequestId,
+        fence: Fence,
+    },
     /// Arbiter → current votee: "someone older wants this; will you yield?"
     Inquire { lock: LockId, req: RequestId },
     /// Requester → arbiter: "taking my vote back, re-grant it." Sent only by a
@@ -105,10 +113,18 @@ pub enum Message {
     Yield { lock: LockId, req: RequestId },
     /// Requester → quorum: records the chosen fence token at the quorum so it
     /// survives the holder crashing before [`Message::Release`].
-    Confirm { lock: LockId, req: RequestId, fence: Fence },
+    Confirm {
+        lock: LockId,
+        req: RequestId,
+        fence: Fence,
+    },
     /// Requester → arbiters: "done, free your vote." Carries the token so the
     /// arbiter bumps its fence *before* granting the next holder.
-    Release { lock: LockId, req: RequestId, fence: Fence },
+    Release {
+        lock: LockId,
+        req: RequestId,
+        fence: Fence,
+    },
     /// Requester → arbiters: "I'm still alive, extend my vote's lease." Sent
     /// periodically while a requester holds (or is collecting) votes.
     Renew { lock: LockId, req: RequestId },
@@ -181,8 +197,16 @@ pub struct Node {
 
 impl Node {
     /// Create a node. `members` is the full cluster membership (including
-    /// `id`). The quorum is a strict majority: `floor(n/2) + 1`.
+    /// `id`) with no duplicates. The quorum is a strict majority:
+    /// `floor(n/2) + 1`.
     pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
+        assert!(!members.is_empty(), "members must not be empty");
+        assert!(
+            members.contains(&id),
+            "members must include the local node id"
+        );
+        let unique: HashSet<NodeId> = members.iter().copied().collect();
+        assert_eq!(unique.len(), members.len(), "members must be unique");
         let quorum = members.len() / 2 + 1;
         Node {
             id,
@@ -205,10 +229,12 @@ impl Node {
 
     /// Begin acquiring `lock`. Broadcasts a vote request to every member
     /// (including self). The lock is held once [`Node::take_acquired`] reports
-    /// it. Re-requesting a lock already being acquired/held replaces the
-    /// in-flight request.
+    /// it. Re-requesting a lock already being acquired/held is idempotent.
     pub fn request(&mut self, now: Instant, lock: &str) {
         self.now = now;
+        if self.requester.contains_key(lock) {
+            return;
+        }
         let ts = self.lamport_tick();
         let req = RequestId { ts, node: self.id };
         self.requester.insert(
@@ -222,7 +248,13 @@ impl Node {
             },
         );
         for m in self.members.clone() {
-            self.send(m, Message::Request { lock: lock.to_string(), req });
+            self.send(
+                m,
+                Message::Request {
+                    lock: lock.to_string(),
+                    req,
+                },
+            );
         }
     }
 
@@ -236,7 +268,11 @@ impl Node {
             for m in self.members.clone() {
                 self.send(
                     m,
-                    Message::Release { lock: lock.to_string(), req: state.req, fence },
+                    Message::Release {
+                        lock: lock.to_string(),
+                        req: state.req,
+                        fence,
+                    },
                 );
             }
         }
@@ -246,6 +282,9 @@ impl Node {
     /// caller's current time.
     pub fn handle(&mut self, now: Instant, from: NodeId, msg: Message) {
         self.now = now;
+        if !self.valid_inbound(from, &msg) {
+            return;
+        }
         match msg {
             Message::Request { lock, req } => self.on_request(lock, req),
             Message::Grant { lock, req, fence } => self.on_grant(from, lock, req, fence),
@@ -265,17 +304,30 @@ impl Node {
         self.now = now;
 
         // Arbiter role: reclaim any votee whose lease has lapsed.
+        let mut revoked: Vec<(NodeId, LockId, RequestId)> = Vec::new();
         let mut grants: Vec<(LockId, (NodeId, RequestId, Fence))> = Vec::new();
         for (lock, a) in self.arbiter.iter_mut() {
             if a.voted_for.is_some() && now >= a.lease {
-                a.inquired = false;
+                if let Some(expired) = a.voted_for {
+                    revoked.push((expired.node, lock.clone(), expired));
+                }
                 if let Some(g) = Self::grant_next(a, now) {
                     grants.push((lock.clone(), g));
                 }
             }
         }
+        for (to, lock, req) in revoked {
+            self.send(to, Message::Revoked { lock, req });
+        }
         for (lock, (to, r, fence)) in grants {
-            self.send(to, Message::Grant { lock, req: r, fence });
+            self.send(
+                to,
+                Message::Grant {
+                    lock,
+                    req: r,
+                    fence,
+                },
+            );
         }
 
         // Requester role: renew the votes we currently hold.
@@ -328,6 +380,41 @@ impl Node {
         self.outbox.push(Outgoing { to, msg });
     }
 
+    fn is_member(&self, id: NodeId) -> bool {
+        self.members.contains(&id)
+    }
+
+    fn valid_inbound(&self, from: NodeId, msg: &Message) -> bool {
+        if !self.is_member(from) {
+            return false;
+        }
+
+        let req = match msg {
+            Message::Request { req, .. }
+            | Message::Grant { req, .. }
+            | Message::Inquire { req, .. }
+            | Message::Yield { req, .. }
+            | Message::Confirm { req, .. }
+            | Message::Release { req, .. }
+            | Message::Renew { req, .. }
+            | Message::Revoked { req, .. } => req,
+        };
+        if !self.is_member(req.node) {
+            return false;
+        }
+
+        match msg {
+            Message::Request { .. }
+            | Message::Yield { .. }
+            | Message::Confirm { .. }
+            | Message::Release { .. }
+            | Message::Renew { .. } => from == req.node,
+            Message::Grant { .. } | Message::Inquire { .. } | Message::Revoked { .. } => {
+                req.node == self.id
+            }
+        }
+    }
+
     // ---- arbiter role ----------------------------------------------------
 
     fn on_request(&mut self, lock: LockId, req: RequestId) {
@@ -358,7 +445,14 @@ impl Node {
             }
         }
         if let Some((to, fence)) = grant {
-            self.send(to, Message::Grant { lock: lock.clone(), req, fence });
+            self.send(
+                to,
+                Message::Grant {
+                    lock: lock.clone(),
+                    req,
+                    fence,
+                },
+            );
         }
         if let Some(current) = inquire {
             self.send(current.node, Message::Inquire { lock, req: current });
@@ -369,6 +463,7 @@ impl Node {
     /// `voted_for` (to the chosen request, or `None` if the queue is empty),
     /// arms a fresh lease, and returns the `Grant` to send.
     fn grant_next(a: &mut ArbiterState, now: Instant) -> Option<(NodeId, RequestId, Fence)> {
+        a.inquired = false;
         match a.queue.iter().next().copied() {
             Some(next) => {
                 a.queue.remove(&next);
@@ -396,7 +491,14 @@ impl Node {
             grant = Self::grant_next(a, now);
         }
         if let Some((to, r, fence)) = grant {
-            self.send(to, Message::Grant { lock, req: r, fence });
+            self.send(
+                to,
+                Message::Grant {
+                    lock,
+                    req: r,
+                    fence,
+                },
+            );
         }
     }
 
@@ -429,7 +531,14 @@ impl Node {
             grant = Self::grant_next(a, now);
         }
         if let Some((to, r, fence)) = grant {
-            self.send(to, Message::Grant { lock, req: r, fence });
+            self.send(
+                to,
+                Message::Grant {
+                    lock,
+                    req: r,
+                    fence,
+                },
+            );
         }
     }
 
@@ -472,7 +581,14 @@ impl Node {
             self.acquired.push((lock.clone(), t));
         }
         for to in confirm {
-            self.send(to, Message::Confirm { lock: lock.clone(), req, fence: token });
+            self.send(
+                to,
+                Message::Confirm {
+                    lock: lock.clone(),
+                    req,
+                    fence: token,
+                },
+            );
         }
     }
 
@@ -527,11 +643,25 @@ impl Node {
             }
             r.votes.remove(&from);
             if r.locked && r.votes.len() < quorum {
-                r.locked = false;
                 lost = true;
             }
         }
         if lost {
+            let state = self
+                .requester
+                .remove(&lock)
+                .expect("requester state existed when loss was detected");
+            let fence = state.best_fence;
+            for m in self.members.clone() {
+                self.send(
+                    m,
+                    Message::Release {
+                        lock: lock.clone(),
+                        req: state.req,
+                        fence,
+                    },
+                );
+            }
             self.lost.push(lock);
         }
     }

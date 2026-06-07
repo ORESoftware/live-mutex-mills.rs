@@ -1,4 +1,4 @@
-//! A dependency-free TCP transport that runs a [`Node`] across real sockets.
+//! A TCP transport that runs a [`Node`] across real sockets.
 //!
 //! ## Design
 //!
@@ -18,13 +18,14 @@
 //! lease renewal/expiry. The happy path is unaffected by the clock.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::codec::{decode, encode};
+use crate::codec::WireCodec;
 use crate::{Fence, LockId, Message, Node, NodeId};
 
 /// A command from the application to its local node.
@@ -54,6 +55,7 @@ enum Ev {
 }
 
 const TICK: Duration = Duration::from_millis(500);
+const MAX_LINE_FRAME: usize = 1024 * 1024;
 
 /// Run a node until it receives [`Command::Shutdown`]. Blocks the calling
 /// thread; spawns helper threads for I/O.
@@ -63,6 +65,18 @@ pub fn run_node(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<NodeEvent>,
 ) -> std::io::Result<()> {
+    run_node_with_codec(id, addrs, WireCodec::Text, cmd_rx, evt_tx)
+}
+
+/// Run a node with an explicit wire codec.
+pub fn run_node_with_codec(
+    id: NodeId,
+    addrs: Vec<String>,
+    codec: WireCodec,
+    cmd_rx: Receiver<Command>,
+    evt_tx: Sender<NodeEvent>,
+) -> std::io::Result<()> {
+    validate_config(id, &addrs)?;
     let n = addrs.len();
     let members: Vec<NodeId> = (0..n as NodeId).collect();
     let mut node = Node::new(id, members);
@@ -90,7 +104,9 @@ pub fn run_node(
         thread::spawn(move || loop {
             match TcpStream::connect(&addr) {
                 Ok(mut s) => {
-                    if writeln!(s, "HELLO {id}").is_ok() && ev_tx.send(Ev::Conn(peer, s)).is_ok() {
+                    if writeln!(s, "HELLO {id} {}", codec.as_str()).is_ok()
+                        && ev_tx.send(Ev::Conn(peer, s)).is_ok()
+                    {
                         return;
                     }
                     return;
@@ -134,7 +150,7 @@ pub fn run_node(
                 writers.insert(peer, stream);
                 if let Some(buffered) = pending.remove(&peer) {
                     for msg in buffered {
-                        write_to(&mut writers, peer, &msg);
+                        write_to(&mut writers, peer, codec, &msg);
                     }
                 }
                 let _ = evt_tx.send(NodeEvent::Info(format!("connected to node {peer}")));
@@ -151,7 +167,7 @@ pub fn run_node(
                 // Deliver to self in-process (still FIFO w.r.t. this node).
                 let _ = ev_tx.send(Ev::In(id, out.msg));
             } else if writers.contains_key(&out.to) {
-                write_to(&mut writers, out.to, &out.msg);
+                write_to(&mut writers, out.to, codec, &out.msg);
             } else {
                 pending.entry(out.to).or_default().push(out.msg);
             }
@@ -167,32 +183,75 @@ pub fn run_node(
     Ok(())
 }
 
-fn write_to(writers: &mut HashMap<NodeId, TcpStream>, to: NodeId, msg: &Message) {
+fn validate_config(id: NodeId, addrs: &[String]) -> io::Result<()> {
+    if addrs.is_empty() {
+        return Err(invalid_input("address list must not be empty"));
+    }
+    if id as usize >= addrs.len() {
+        return Err(invalid_input("node id is outside the address list"));
+    }
+    if addrs.iter().any(|addr| addr.trim().is_empty()) {
+        return Err(invalid_input("addresses must not be empty"));
+    }
+
+    let mut seen = HashSet::with_capacity(addrs.len());
+    if addrs.iter().any(|addr| !seen.insert(addr)) {
+        return Err(invalid_input("addresses must be unique"));
+    }
+
+    Ok(())
+}
+
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn write_to(writers: &mut HashMap<NodeId, TcpStream>, to: NodeId, codec: WireCodec, msg: &Message) {
     if let Some(w) = writers.get_mut(&to) {
-        if writeln!(w, "{}", encode(msg)).is_err() {
+        if writeln!(w, "{}", codec.encode_line(msg)).is_err() {
             // Connection broke; drop it. Leases + the peer's redial recover.
             writers.remove(&to);
         }
     }
 }
 
-/// Read a connection: first a `HELLO <id>` handshake, then one message per line.
+/// Read a connection: first `HELLO <id> [codec]`, then one message per line.
 fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>) {
     let mut r = BufReader::new(stream);
     let mut line = String::new();
     if r.read_line(&mut line).is_err() {
         return;
     }
-    let peer: NodeId = match line.trim().strip_prefix("HELLO ").and_then(|s| s.parse().ok()) {
-        Some(p) => p,
+    if line.len() > MAX_LINE_FRAME {
+        return;
+    }
+    let mut hello = line.split_whitespace();
+    if hello.next() != Some("HELLO") {
+        return;
+    }
+    let peer: NodeId = match hello.next().and_then(|s| s.parse().ok()) {
+        Some(id) => id,
         None => return,
     };
+    let codec = match hello.next() {
+        Some(name) => match WireCodec::parse(name) {
+            Some(codec) => codec,
+            None => return,
+        },
+        None => WireCodec::Text,
+    };
+    if hello.next().is_some() {
+        return;
+    }
     loop {
         line.clear();
         match r.read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
-                if let Some(msg) = decode(line.trim()) {
+                if line.len() > MAX_LINE_FRAME {
+                    return;
+                }
+                if let Some(msg) = codec.decode_line(line.trim()) {
                     if ev_tx.send(Ev::In(peer, msg)).is_err() {
                         return;
                     }

@@ -6,19 +6,37 @@
 //! strictly increase — i.e. the protocol behaves correctly across the wire, not
 //! just in the in-memory simulator.
 
+use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use live_mutex_mills::transport::{run_node, Command, NodeEvent};
+use live_mutex_mills::codec::WireCodec;
+use live_mutex_mills::transport::{run_node_with_codec, Command, NodeEvent};
 use live_mutex_mills::NodeId;
 
 #[test]
-fn three_nodes_over_tcp_take_turns() {
-    let addrs: Vec<String> = ["127.0.0.1:18111", "127.0.0.1:18112", "127.0.0.1:18113"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+fn three_nodes_over_tcp_take_turns_text_codec() {
+    three_nodes_over_tcp_take_turns([WireCodec::Text; 3]);
+}
+
+#[test]
+fn three_nodes_over_tcp_take_turns_json_codec() {
+    three_nodes_over_tcp_take_turns([WireCodec::Json; 3]);
+}
+
+#[test]
+fn three_nodes_over_tcp_take_turns_msgpack_codec() {
+    three_nodes_over_tcp_take_turns([WireCodec::Msgpack; 3]);
+}
+
+#[test]
+fn three_nodes_over_tcp_take_turns_mixed_codecs() {
+    three_nodes_over_tcp_take_turns([WireCodec::Text, WireCodec::Json, WireCodec::Msgpack]);
+}
+
+fn three_nodes_over_tcp_take_turns(codecs: [WireCodec; 3]) {
+    let addrs = loopback_addrs(3);
 
     // One combined channel carries (node_id, event) from every node.
     let (comb_tx, comb_rx) = mpsc::channel::<(NodeId, NodeEvent)>();
@@ -30,6 +48,7 @@ fn three_nodes_over_tcp_take_turns() {
         let (evt_tx, evt_rx) = mpsc::channel();
         let addrs = addrs.clone();
         let comb = comb_tx.clone();
+        let codec = codecs[id as usize];
         thread::spawn(move || {
             for e in evt_rx {
                 if comb.send((id, e)).is_err() {
@@ -38,7 +57,7 @@ fn three_nodes_over_tcp_take_turns() {
             }
         });
         thread::spawn(move || {
-            let _ = run_node(id, addrs, cmd_rx, evt_tx);
+            let _ = run_node_with_codec(id, addrs, codec, cmd_rx, evt_tx);
         });
     }
 
@@ -63,9 +82,7 @@ fn three_nodes_over_tcp_take_turns() {
                 // Hold briefly, then release so the next contender proceeds.
                 thread::sleep(Duration::from_millis(50));
                 held -= 1;
-                cmd_txs[id as usize]
-                    .send(Command::Release(lock))
-                    .unwrap();
+                cmd_txs[id as usize].send(Command::Release(lock)).unwrap();
             }
             Ok(_) => {} // Info/Lost — ignore
             Err(_) => break,
@@ -76,8 +93,25 @@ fn three_nodes_over_tcp_take_turns() {
         let _ = tx.send(Command::Shutdown);
     }
 
-    assert_eq!(fences.len(), 3, "all three nodes should acquire over TCP; got {fences:?}");
+    assert_eq!(
+        fences.len(),
+        3,
+        "all three nodes should acquire over TCP via {codecs:?}; got {fences:?}"
+    );
     for w in fences.windows(2) {
-        assert!(w[1] > w[0], "fence tokens must strictly increase over TCP: {fences:?}");
+        assert!(
+            w[1] > w[0],
+            "fence tokens must strictly increase over TCP: {fences:?}"
+        );
     }
+}
+
+fn loopback_addrs(n: usize) -> Vec<String> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback port"))
+        .collect();
+    listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().to_string())
+        .collect()
 }

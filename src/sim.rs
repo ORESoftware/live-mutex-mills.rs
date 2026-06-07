@@ -47,6 +47,7 @@ impl Sim {
     /// Build an `n`-node cluster with an explicit PRNG seed (for reproducible
     /// delivery orders across test cases).
     pub fn with_seed(n: usize, seed: u64) -> Self {
+        assert!(n > 0, "sim cluster must contain at least one node");
         let members: Vec<NodeId> = (0..n as NodeId).collect();
         let nodes = (0..n as NodeId)
             .map(|id| Node::new(id, members.clone()))
@@ -56,7 +57,11 @@ impl Sim {
             links: HashMap::new(),
             dead: HashSet::new(),
             clock: 0,
-            rng: if seed == 0 { 0x1234_5678_9ABC_DEF1 } else { seed },
+            rng: if seed == 0 {
+                0x1234_5678_9ABC_DEF1
+            } else {
+                seed
+            },
         }
     }
 
@@ -69,13 +74,17 @@ impl Sim {
     /// queued to/from it are dropped (a fail-stop + partition). Its votes held
     /// at other arbiters will lapse and be reclaimed once time advances.
     pub fn crash(&mut self, node: NodeId) {
+        if !self.has_node(node) {
+            return;
+        }
         self.dead.insert(node);
-        self.links.retain(|&(from, to), _| from != node && to != node);
+        self.links
+            .retain(|&(from, to), _| from != node && to != node);
     }
 
     /// Have `node` start acquiring `lock`.
     pub fn request(&mut self, node: NodeId, lock: &str) {
-        if self.dead.contains(&node) {
+        if !self.has_node(node) || self.dead.contains(&node) {
             return;
         }
         self.nodes[node as usize].request(self.clock, lock);
@@ -84,7 +93,7 @@ impl Sim {
 
     /// Have `node` release `lock`.
     pub fn release(&mut self, node: NodeId, lock: &str) {
-        if self.dead.contains(&node) {
+        if !self.has_node(node) || self.dead.contains(&node) {
             return;
         }
         self.nodes[node as usize].release(self.clock, lock);
@@ -159,6 +168,10 @@ impl Sim {
             }
             self.links.entry((from, to)).or_default().push_back(msg);
         }
+    }
+
+    fn has_node(&self, node: NodeId) -> bool {
+        (node as usize) < self.nodes.len()
     }
 
     fn next_rand(&mut self) -> u64 {

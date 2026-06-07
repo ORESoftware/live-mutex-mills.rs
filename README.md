@@ -47,7 +47,8 @@ reorders within a link.
   `take_acquired` and of lost locks with `take_lost`.
 - `src/sim.rs` — a deterministic, seedable FIFO network simulator with
   `crash()` and `advance()` for exercising holder failure.
-- `src/codec.rs` — a dependency-free line codec for the wire.
+- `src/codec.rs` — selectable wire codecs: the original text line format,
+  compact JSON lines, and hex-framed MessagePack.
 - `src/transport.rs` + `src/bin/lmxd.rs` — a real **TCP transport** and node
   daemon. One TCP connection per directed link (= FIFO), single-threaded driver
   owning the `Node`, wall-clock-driven leases.
@@ -74,6 +75,8 @@ lmxd 2 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
 Then type `acquire <lock>` / `release <lock>` / `quit` on any node's stdin; it
 prints `ACQUIRED <lock> fence=<n>` when the lock is held. Crash a holder
 (`Ctrl-C`) and a survivor takes over once the lease lapses, with a higher fence.
+Pass `--codec text`, `--codec json`, or `--codec msgpack` before `my_id` to
+choose the wire format; `text` is the default.
 
 ## Known limitation: token durability window
 

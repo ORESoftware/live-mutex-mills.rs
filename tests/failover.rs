@@ -70,7 +70,7 @@ fn contended_failover_all_survivors_acquire() {
     let mut tokens: Vec<Fence> = Vec::new();
     let mut first: Option<NodeId> = None;
     'wait: for _ in 0..100_000 {
-        for (n, _l, fence) in sim.drain_acquired() {
+        if let Some((n, _l, fence)) = sim.drain_acquired().into_iter().next() {
             first = Some(n);
             tokens.push(fence);
             break 'wait;
