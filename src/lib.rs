@@ -332,18 +332,36 @@ impl Node {
             );
         }
 
-        // Requester role: renew the votes we currently hold.
+        // Requester role: renew held votes, and re-broadcast any request that is
+        // still acquiring. Re-broadcasting recovers a Request lost while a link
+        // was churning (e.g. a rolling restart): receivers de-duplicate it and
+        // the RequestId is unchanged, so queue fairness is preserved. (A lost
+        // Grant self-heals separately — the arbiter's vote lease lapses and it
+        // re-grants.) Without this a one-shot message loss wedges the requester.
+        let quorum = self.quorum;
         let mut renews: Vec<(NodeId, LockId, RequestId)> = Vec::new();
+        let mut rebroadcasts: Vec<(LockId, RequestId)> = Vec::new();
         for (lock, r) in self.requester.iter_mut() {
-            if !r.votes.is_empty() && now >= r.next_renew {
+            if now >= r.next_renew {
                 r.next_renew = now + RENEW_INTERVAL;
                 for &v in r.votes.iter() {
                     renews.push((v, lock.clone(), r.req));
+                }
+                if !r.locked && r.votes.len() < quorum {
+                    rebroadcasts.push((lock.clone(), r.req));
                 }
             }
         }
         for (to, lock, req) in renews {
             self.send(to, Message::Renew { lock, req });
+        }
+        if !rebroadcasts.is_empty() {
+            let members = self.members.clone();
+            for (lock, req) in rebroadcasts {
+                for &m in &members {
+                    self.send(m, Message::Request { lock: lock.clone(), req });
+                }
+            }
         }
     }
 

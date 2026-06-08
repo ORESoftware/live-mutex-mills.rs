@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use live_mutex_mills::broker_runtime_config::{
     BrokerRuntimeConfig, BrokerRuntimeConfigError, USAGE,
@@ -112,10 +113,20 @@ fn main() {
             if let Some(first) = c.pending() {
                 let _ = cmd.send(Command::Acquire(first.clone()));
             }
+            // Bound each attempt: the node self-heals dropped messages via
+            // re-broadcast, but if an attempt still stalls we release and retry
+            // rather than wedge forever on a one-shot kickoff.
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut held = false;
             while !c.is_held() {
-                let (lock, fence) = match demo_rx.recv() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break; // stalled — fall through to release + retry
+                }
+                let (lock, fence) = match demo_rx.recv_timeout(remaining) {
                     Ok(v) => v,
-                    Err(_) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 };
                 match c.on_acquired(&lock, fence) {
                     Progress::Next(k) => {
@@ -128,14 +139,20 @@ fn main() {
                             .map(|k| format!("{k}={}", c.fence(k).unwrap_or(0)))
                             .collect();
                         println!("DEMO COMPOSITE HELD [{}]", parts.join(", "));
+                        held = true;
                     }
                     Progress::Ignored => {}
                 }
             }
-            thread::sleep(demo_hold);
+            if held {
+                thread::sleep(demo_hold);
+            }
+            // Release every component (clears partial node state), then drain any
+            // stale acquisitions so the next attempt starts clean.
             for k in c.keys() {
                 let _ = cmd.send(Command::Release(k.clone()));
             }
+            while demo_rx.try_recv().is_ok() {}
             thread::sleep(demo_rest);
         });
     } else {

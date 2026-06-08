@@ -165,6 +165,7 @@ pub enum ClientError {
     BadLimit,
     NotHeld,
     HolderMismatch,
+    Timeout,
 }
 
 impl ClientError {
@@ -175,6 +176,7 @@ impl ClientError {
             Self::BadLimit => 400,
             Self::NotHeld => 404,
             Self::HolderMismatch => 409,
+            Self::Timeout => 408,
         }
     }
 
@@ -185,6 +187,7 @@ impl ClientError {
             Self::BadLimit => "bad_limit",
             Self::NotHeld => "not_held",
             Self::HolderMismatch => "holder_mismatch",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -200,6 +203,7 @@ impl fmt::Display for ClientError {
             ),
             Self::NotHeld => write!(f, "holder token does not refer to a held lock"),
             Self::HolderMismatch => write!(f, "holder token does not own that lock"),
+            Self::Timeout => write!(f, "lock acquire timed out"),
         }
     }
 }
@@ -322,6 +326,35 @@ impl LockClient {
         rx.recv()
             .map(|(_, result)| result)
             .unwrap_or(Err(ClientError::Stopped))
+    }
+
+    /// Like [`LockClient::acquire`], but gives up after `timeout`: it cancels the
+    /// pending request and returns [`ClientError::Timeout`]. Use this to bound
+    /// waits under genuine, sustained contention (dropped messages already
+    /// self-heal, so a timeout means the lock is really held elsewhere).
+    pub fn acquire_timeout(
+        &self,
+        lock: impl Into<LockId>,
+        timeout: Duration,
+    ) -> Result<ClientAcquire, ClientError> {
+        let lock = lock.into();
+        if lock.is_empty() {
+            return Err(ClientError::EmptyLock);
+        }
+        let (reply, rx) = mpsc::channel();
+        let waiter = self.enqueue_acquire(
+            lock.clone(),
+            ClientResource::Lock { lock: lock.clone() },
+            reply,
+        )?;
+        match rx.recv_timeout(timeout) {
+            Ok((_, result)) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancel_acquire(lock, waiter);
+                Err(ClientError::Timeout)
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(ClientError::Stopped),
+        }
     }
 
     /// Queue for one permit from a fixed-size semaphore.
@@ -904,6 +937,13 @@ fn cancel_acquire(
     if let Some(queue) = locks.get_mut(lock) {
         if let Some(pos) = queue.waiters.iter().position(|queued| queued.id == waiter) {
             queue.waiters.remove(pos);
+            // If that was the last waiter and a node request is still in flight,
+            // cancel it so the node doesn't end up holding an orphan lock that
+            // nobody is waiting for.
+            if queue.waiters.is_empty() && queue.holder.is_none() && queue.acquiring {
+                queue.acquiring = false;
+                let _ = cmd_tx.send(Command::Release(lock.to_string()));
+            }
             return;
         }
     }
