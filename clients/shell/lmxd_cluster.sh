@@ -14,6 +14,9 @@
 # dependency is bash plus the `lmxd` binary (built from this repo with cargo).
 # Source this file and call the lmx_* functions; see smoke.sh for usage.
 
+# LMX_FENCE is part of the public API (set by lmx_acquire).
+# shellcheck disable=SC2034
+
 : "${LMX_NODES:=3}"          # cluster size (quorum is floor(n/2)+1)
 : "${LMX_BASE_PORT:=9300}"   # first loopback port; node i listens on BASE+i
 : "${LMX_CODEC:=text}"       # text | json | msgpack
@@ -33,7 +36,9 @@ lmx_resolve_bin() {
   LMX_BIN="$repo/target/release/lmxd"
 }
 
-# lmx_start_cluster [n]  — launch n nodes; node i stdin is fd (10+i).
+# lmx_start_cluster [n]  — launch n nodes. Each node's stdin is a FIFO held open
+# on fd (10+i) so the daemon never sees EOF; commands are written to the FIFO
+# path (no eval on user data).
 lmx_start_cluster() {
   local n="${1:-$LMX_NODES}"
   lmx_resolve_bin || { echo "[lmx] could not build/find lmxd" >&2; return 1; }
@@ -46,23 +51,25 @@ lmx_start_cluster() {
       <"$LMX_RUNDIR/n$i.in" >"$LMX_RUNDIR/n$i.out" 2>&1 &
     echo $! >"$LMX_RUNDIR/n$i.pid"
     disown 2>/dev/null || true   # silence bash "Terminated" notices on teardown
-    # Hold each node's stdin FIFO open on a fixed fd (bash 3.2-compatible).
-    eval "exec $((10 + i))>\"$LMX_RUNDIR/n$i.in\""
+    # Hold each node's stdin FIFO open on a fixed fd so the reader never hits
+    # EOF. eval is required for a dynamic fd on bash 3.2 (no {var} redirections);
+    # both operands are trusted here (numeric fd + a mktemp path).
+    eval "exec $((10 + i))>\"\$LMX_RUNDIR/n\$i.in\""
   done
   sleep 2   # let the mesh dial up (logs print "connected to node N")
 }
 
-# lmx_node_send <id> <command...>
+# lmx_node_send <id> <command...>  — append one command line to a node's stdin.
 lmx_node_send() {
   local id="$1"; shift
-  eval "printf '%s\n' \"\$*\" >&$((10 + id))"
+  printf '%s\n' "$*" >"$LMX_RUNDIR/n$id.in"
 }
 
-# Wait until <file> contains <pattern>, up to LMX_WAIT seconds.
+# Wait until <file> contains the literal <pattern>, up to LMX_WAIT seconds.
 _lmx_wait_for() {
   local f="$1" pat="$2" t="${3:-$LMX_WAIT}" i=0
   while [ "$i" -lt $((t * 10)) ]; do
-    grep -q -- "$pat" "$f" 2>/dev/null && return 0
+    grep -qF -- "$pat" "$f" 2>/dev/null && return 0
     sleep 0.1; i=$((i + 1))
   done
   return 1
@@ -74,7 +81,13 @@ lmx_acquire() {
   lmx_node_send "$id" "acquire $lock"
   _lmx_wait_for "$LMX_RUNDIR/n$id.out" "ACQUIRED $lock fence=" || {
     echo "[lmx] timed out waiting for ACQUIRED $lock on node $id" >&2; return 1; }
-  LMX_FENCE="$(sed -n "s/.*ACQUIRED $lock fence=\([0-9][0-9]*\).*/\1/p" "$LMX_RUNDIR/n$id.out" | tail -1)"
+  # Exact-match the lock name (field compare, so regex metacharacters in the
+  # lock name are harmless) and read the fence off the latest grant line.
+  LMX_FENCE="$(awk -v L="$lock" '
+    $1 == "ACQUIRED" && $2 == L {
+      for (i = 3; i <= NF; i++) if ($i ~ /^fence=/) { t = $i; sub(/^fence=/, "", t); f = t }
+    }
+    END { if (f != "") print f }' "$LMX_RUNDIR/n$id.out")"
 }
 
 # lmx_release <node_id> <lock>

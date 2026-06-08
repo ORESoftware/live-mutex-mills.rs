@@ -52,9 +52,13 @@ reorders within a link.
 - `src/transport.rs` + `src/bin/lmxd.rs` — a real **TCP transport** and node
   daemon. One TCP connection per directed link (= FIFO), single-threaded driver
   owning the `Node`, wall-clock-driven leases.
+- `src/client_api.rs` — language-neutral client surfaces on top of `lmxd`:
+  HTTP/JSON and line-oriented TCP for exclusive locks, bounded semaphores, and
+  bounded-reader RW locks.
 - `tests/` — property tests over randomized FIFO interleavings (mutual
   exclusion, progress, monotonic fencing), holder-failover recovery, codec
-  round-trips, and a 3-node end-to-end test over real loopback TCP.
+  round-trips, external HTTP/TCP client APIs, and 3-node end-to-end tests over
+  real loopback TCP.
 - `examples/contention.rs` — `cargo run --example contention`.
 
 ```
@@ -62,21 +66,107 @@ cargo test                       # all properties + failover + TCP smoke
 cargo run --example contention   # watch 9 nodes hand a lock around
 ```
 
+`lmxd` statically compiles the vendored `flags-2-env` C parser during
+`cargo build` / `cargo install`, so a C compiler toolchain is required at build
+time. No `flags2env` shared library is required at runtime.
+
 ### Running a real cluster
 
 Start one process per node; `my_id` indexes the address list:
 
 ```
-lmxd 0 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
-lmxd 1 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
-lmxd 2 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+lmxd --client-http 127.0.0.1:9200 --client-tcp 127.0.0.1:9300 \
+  0 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+lmxd --client-http 127.0.0.1:9201 --client-tcp 127.0.0.1:9301 \
+  1 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
+lmxd --client-http 127.0.0.1:9202 --client-tcp 127.0.0.1:9302 \
+  2 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102
 ```
 
-Then type `acquire <lock>` / `release <lock>` / `quit` on any node's stdin; it
-prints `ACQUIRED <lock> fence=<n>` when the lock is held. Crash a holder
-(`Ctrl-C`) and a survivor takes over once the lease lapses, with a higher fence.
-Pass `--codec text`, `--codec json`, or `--codec msgpack` before `my_id` to
-choose the wire format; `text` is the default.
+You can still type `acquire <lock>` / `release <lock>` / `quit` on any node's
+stdin; it prints `ACQUIRED <lock> fence=<n>` when the lock is held. Pass
+`--codec text`, `--codec json`, or `--codec msgpack` before `my_id` to choose
+the peer-mesh wire format; `text` is the default.
+
+`lmxd` broker flags are declared in `.cli-flags.toml` and parsed with
+`ORESoftware/flags-2-env`. Named CLI flags override positional values, which
+override environment variables; typed defaults are applied last. This
+configuration is for the broker process, not for external clients. Run
+`lmxd --help` for the generated flag table. Supported broker env keys include
+`LMX_CLI_FLAGS_CONFIG`, `LMX_CODEC`, `LMX_NODE_ID`, `LMX_PEER_ADDRS`,
+`LMX_CLIENT_HTTP`, `LMX_CLIENT_TCP`, `LMX_STDIN`, `LMX_LOG_INFO`,
+`LMX_CONNECT_RETRY_MS`, `LMX_TICK_MS`, `LMX_MAX_FRAME_BYTES`, `LMX_DEMO`,
+`LMX_DEMO_KEYS`, `LMX_DEMO_HOLD_MS`, and `LMX_DEMO_REST_MS`.
+
+### External clients
+
+The client API is separate from the peer-to-peer TCP mesh. Any language that can
+make HTTP requests or open a TCP socket can request a lock from any `lmxd` node.
+Release the returned `holder` token back to the same node endpoint that granted
+it; that node is the protocol requester holding the quorum votes.
+
+HTTP/JSON:
+
+```
+POST /locks/report-A/acquire
+=> {"ok":true,"lock":"report-A","fence":1,"holder":"h0000000000000001"}
+
+POST /locks/report-A/release
+{"holder":"h0000000000000001"}
+=> {"ok":true,"lock":"report-A"}
+```
+
+Line-oriented TCP:
+
+```
+ACQUIRE report-A
+ACQUIRED report-A fence=1 holder=h0000000000000001
+RELEASE h0000000000000001
+RELEASED report-A
+```
+
+Bounded semaphores are built from exclusive permit slots. A limit-10 semaphore
+allows at most ten concurrent holders for the same `(name, limit)`:
+
+```
+POST /semaphores/api-rate/acquire
+{"limit":10}
+=> {"ok":true,"semaphore":"api-rate","limit":10,"permit":3,"fence":7,"holder":"h0000000000000009"}
+
+SEMACQUIRE 10 api-rate
+SEMACQUIRED api-rate limit=10 permit=4 fence=8 holder=h000000000000000a
+```
+
+Semaphore limits are intentionally capped at 2..100; use exclusive locks for
+limit 1. Callers must use the same `(name, limit)` to contend for the same
+semaphore namespace.
+
+RW locks use the same bounded-slot idea for readers. A read acquire takes one
+reader permit; a write acquire takes an admission gate and then all reader
+permits. That means readers can share up to `limit`, writers are exclusive, and
+once a writer reaches the gate, later readers wait behind it:
+
+```
+POST /rwlocks/report-A/read-acquire
+{"limit":10}
+=> {"ok":true,"rwlock":"report-A","mode":"read","limit":10,"permit":3,"fence":12,"holder":"rw0000000000000001"}
+
+POST /rwlocks/report-A/write-acquire
+{"limit":10}
+=> {"ok":true,"rwlock":"report-A","mode":"write","limit":10,"fence":18,"holder":"rw0000000000000002"}
+
+RACQUIRE 10 report-A
+RWACQUIRED report-A mode=read limit=10 permit=4 fence=13 holder=rw0000000000000003
+
+WACQUIRE 10 report-A
+RWACQUIRED report-A mode=write limit=10 fence=19 holder=rw0000000000000004
+```
+
+RW lock limits are intentionally capped at 2..100. Readers and writers must use
+the same `(name, limit)` to contend for the same RW lock namespace.
+
+Crash a holder (`Ctrl-C`) and a survivor takes over once the lease lapses, with
+a higher fence.
 
 ## Known limitation: token durability window
 
@@ -106,6 +196,8 @@ failover fencing is strictly monotonic (see `tests/failover.rs`).
 - ✅ Quorum/vote core with timestamp preemption (deadlock-free) and fencing.
 - ✅ Vote leases + holder-failure recovery (physical time, failure path only).
 - ✅ TCP transport + `lmxd` daemon, verified across processes.
+- ✅ External HTTP/TCP client APIs for exclusive locks, bounded semaphores, and
+  bounded-reader RW locks.
 
 ## Design provenance
 

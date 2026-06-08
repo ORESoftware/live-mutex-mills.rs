@@ -1,0 +1,105 @@
+[help]
+url = "https://github.com/ORESoftware/flags-2-env"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+stop_at_first_positional = true
+positionals_env = "LMX_POSITIONALS"
+unknown_options_env = "LMX_UNKNOWN_OPTIONS"
+errors_env = "LMX_PARSE_ERRORS"
+allow_unknown = false
+
+[flags.cli-flags-config]
+env = "LMX_CLI_FLAGS_CONFIG"
+aliases = ["config", "cli-flags"]
+type = "string"
+help = "Path to the broker .cli-flags.toml file. Also accepted before parsing."
+
+[flags.codec]
+env = "LMX_CODEC"
+aliases = ["codec"]
+short = "c"
+type = "string"
+help = "Broker peer-mesh wire codec: text, json, or msgpack."
+
+[flags.node-id]
+env = "LMX_NODE_ID"
+aliases = ["my-id", "id"]
+short = "i"
+type = "integer"
+help = "Broker node id. The first positional argument is still accepted."
+
+[flags.peer-addrs]
+env = "LMX_PEER_ADDRS"
+aliases = ["addrs", "peers"]
+short = "a"
+type = "string"
+help = "Comma-separated broker peer address list. Positional addresses are still accepted."
+
+[flags.client-http]
+env = "LMX_CLIENT_HTTP"
+aliases = ["http-client"]
+type = "string"
+help = "HTTP listener address exposed by this broker for external lock clients."
+
+[flags.client-tcp]
+env = "LMX_CLIENT_TCP"
+aliases = ["tcp-client"]
+type = "string"
+help = "Line-oriented TCP listener address exposed by this broker for external lock clients."
+
+[flags.stdin]
+env = "LMX_STDIN"
+aliases = ["stdin"]
+type = "bool"
+true_aliases = ["t", "1", "yes", "on"]
+false_aliases = ["f", "0", "no", "off"]
+help = "Enable broker stdin commands. Use --no-stdin for daemon-only mode."
+
+[flags.log-info]
+env = "LMX_LOG_INFO"
+aliases = ["connection-logs"]
+type = "bool"
+true_aliases = ["t", "1", "yes", "on"]
+false_aliases = ["f", "0", "no", "off"]
+help = "Print broker diagnostic info events such as peer connection notices."
+
+[flags.connect-retry-ms]
+env = "LMX_CONNECT_RETRY_MS"
+aliases = ["dial-retry-ms"]
+type = "integer"
+help = "Milliseconds to wait between peer dial attempts."
+
+[flags.tick-ms]
+env = "LMX_TICK_MS"
+type = "integer"
+help = "Broker transport tick interval in milliseconds."
+
+[flags.max-frame-bytes]
+env = "LMX_MAX_FRAME_BYTES"
+aliases = ["max-line-frame"]
+type = "integer"
+help = "Maximum bytes accepted for one peer mesh line frame."
+
+[flags.demo]
+env = "LMX_DEMO"
+aliases = ["demo"]
+type = "bool"
+true_aliases = ["t", "1", "yes", "on"]
+false_aliases = ["f", "0", "no", "off"]
+help = "Enable the broker self-test composite-lock workload."
+
+[flags.demo-keys]
+env = "LMX_DEMO_KEYS"
+type = "string"
+help = "Comma-separated lock keys used by the broker self-test workload."
+
+[flags.demo-hold-ms]
+env = "LMX_DEMO_HOLD_MS"
+type = "integer"
+help = "Milliseconds the broker self-test holds a composite lock."
+
+[flags.demo-rest-ms]
+env = "LMX_DEMO_REST_MS"
+type = "integer"
+help = "Milliseconds the broker self-test waits after release."

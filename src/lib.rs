@@ -53,6 +53,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+pub mod broker_runtime_config;
+pub mod client_api;
 pub mod codec;
 pub mod composite;
 pub mod sim;

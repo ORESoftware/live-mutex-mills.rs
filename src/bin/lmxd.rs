@@ -1,83 +1,82 @@
 //! `lmxd` — a live-mutex-mills node daemon over TCP.
 //!
 //! Usage:
-//!   lmxd [--codec text|json|msgpack] <my_id> <addr_0> <addr_1> ... <addr_{n-1}>
+//!   lmxd [--codec text|json|msgpack] [--client-http addr] [--client-tcp addr] \
+//!        <my_id> <addr_0> <addr_1> ... <addr_{n-1}>
 //!
 //! `my_id` indexes into the address list. Start one process per node, e.g.:
 //!   lmxd 0 127.0.0.1:9000 127.0.0.1:9001 127.0.0.1:9002
 //!   lmxd 1 127.0.0.1:9000 127.0.0.1:9001 127.0.0.1:9002
 //!   lmxd 2 127.0.0.1:9000 127.0.0.1:9001 127.0.0.1:9002
 //!
-//! Then type commands on stdin:
+//! Then type commands on stdin, or through either client listener:
 //!   acquire <lock>   release <lock>   quit
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
-use live_mutex_mills::codec::WireCodec;
+use live_mutex_mills::broker_runtime_config::{
+    BrokerRuntimeConfig, BrokerRuntimeConfigError, USAGE,
+};
+use live_mutex_mills::client_api::{serve_http, serve_tcp, start_coordinator};
 use live_mutex_mills::composite::{Composite, Progress};
-use live_mutex_mills::transport::{run_node_with_codec, Command, NodeEvent};
+use live_mutex_mills::transport::{run_node_with_settings, Command, NodeEvent};
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!(
-            "usage: lmxd [--codec text|json|msgpack] <my_id> <addr_0> <addr_1> ... <addr_{{n-1}}>"
-        );
-        std::process::exit(2);
-    }
-    let mut codec = WireCodec::Text;
-    let mut offset = 1usize;
-    if args.get(1).is_some_and(|s| s == "--codec") {
-        let Some(raw) = args.get(2) else {
-            eprintln!("missing codec after --codec; use text, json, or msgpack");
+    let config = match BrokerRuntimeConfig::from_process() {
+        Ok(config) => config,
+        Err(BrokerRuntimeConfigError::HelpRequested(help)) => {
+            print!("{help}");
+            return;
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            eprintln!("{USAGE}");
             std::process::exit(2);
-        };
-        codec = WireCodec::parse(raw).unwrap_or_else(|| {
-            eprintln!("unknown codec {raw:?}; use text, json, or msgpack");
-            std::process::exit(2);
-        });
-        offset = 3;
-    } else if let Some(raw) = args.get(1).and_then(|s| s.strip_prefix("--codec=")) {
-        codec = WireCodec::parse(raw).unwrap_or_else(|| {
-            eprintln!("unknown codec {raw:?}; use text, json, or msgpack");
-            std::process::exit(2);
-        });
-        offset = 2;
-    }
-    if args.len() < offset + 2 {
-        eprintln!(
-            "usage: lmxd [--codec text|json|msgpack] <my_id> <addr_0> <addr_1> ... <addr_{{n-1}}>"
-        );
-        std::process::exit(2);
-    }
-    let id: u32 = args[offset].parse().unwrap_or_else(|_| {
-        eprintln!("my_id must be a non-negative integer");
-        std::process::exit(2);
-    });
-    let addrs: Vec<String> = args[offset + 1..].to_vec();
-    if id as usize >= addrs.len() {
-        eprintln!("my_id {id} is outside the address list");
-        std::process::exit(2);
-    }
+        }
+    };
+
+    let id = config.id;
+    let addrs = config.addrs;
+    let codec = config.codec;
+    let client_http = config.client_http;
+    let client_tcp = config.client_tcp;
+    let stdin_enabled = config.stdin;
+    let log_info = config.log_info;
+    let transport = config.transport;
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (evt_tx, evt_rx) = mpsc::channel();
+    let (raw_evt_tx, raw_evt_rx) = mpsc::channel();
+    let (client, evt_rx) = start_coordinator(cmd_tx.clone(), raw_evt_rx);
+
+    if let Some(addr) = client_http {
+        match serve_http(&addr, client.clone()) {
+            Ok(bound) => println!("# client HTTP listening on {bound}"),
+            Err(e) => {
+                eprintln!("client HTTP bind error on {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(addr) = client_tcp {
+        match serve_tcp(&addr, client.clone()) {
+            Ok(bound) => println!("# client TCP listening on {bound}"),
+            Err(e) => {
+                eprintln!("client TCP bind error on {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Optional self-test workload (LMX_DEMO=1): every node repeatedly acquires
     // the SAME composite (multi-key) lock under contention, so the logs show
     // exclusive handoff across peers with strictly-increasing per-key fences.
-    let demo_enabled = std::env::var("LMX_DEMO")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    let demo_keys: Vec<String> = std::env::var("LMX_DEMO_KEYS")
-        .unwrap_or_else(|_| "cap,mid,zed".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let demo_enabled = config.demo.enabled;
+    let demo_keys = config.demo.keys;
+    let demo_hold = config.demo.hold;
+    let demo_rest = config.demo.rest;
     let (demo_tx, demo_rx) = mpsc::channel::<(String, live_mutex_mills::Fence)>();
 
     // Print events (and feed acquisitions to the demo driver).
@@ -89,7 +88,11 @@ fn main() {
                     let _ = demo_tx.send((lock, fence));
                 }
                 NodeEvent::Lost(lock) => println!("LOST {lock}"),
-                NodeEvent::Info(s) => println!("# {s}"),
+                NodeEvent::Info(s) => {
+                    if log_info {
+                        println!("# {s}");
+                    }
+                }
             }
         }
     });
@@ -129,54 +132,69 @@ fn main() {
                     Progress::Ignored => {}
                 }
             }
-            thread::sleep(Duration::from_millis(800));
+            thread::sleep(demo_hold);
             for k in c.keys() {
                 let _ = cmd.send(Command::Release(k.clone()));
             }
-            thread::sleep(Duration::from_millis(400));
+            thread::sleep(demo_rest);
         });
     } else {
         drop(demo_rx);
     }
 
     // Read stdin commands.
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            let mut it = line.split_whitespace();
-            match it.next() {
-                Some("acquire") => {
-                    if let Some(l) = it.next() {
-                        let _ = cmd_tx.send(Command::Acquire(l.to_string()));
+    if stdin_enabled {
+        thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut stdin_holders = HashMap::<String, String>::new();
+            for line in stdin.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let mut it = line.split_whitespace();
+                match it.next() {
+                    Some("acquire") => {
+                        if let Some(l) = it.next() {
+                            match client.acquire(l.to_string()) {
+                                Ok(a) => {
+                                    stdin_holders.insert(a.lock, a.holder);
+                                }
+                                Err(e) => eprintln!("acquire failed: {e}"),
+                            }
+                        }
                     }
-                }
-                Some("release") => {
-                    if let Some(l) = it.next() {
-                        let _ = cmd_tx.send(Command::Release(l.to_string()));
+                    Some("release") => {
+                        if let Some(l) = it.next() {
+                            match stdin_holders.remove(l) {
+                                Some(holder) => {
+                                    if let Err(e) = client.release_lock(l.to_string(), holder) {
+                                        eprintln!("release failed: {e}");
+                                    }
+                                }
+                                None => eprintln!("lock {l:?} is not held by stdin"),
+                            }
+                        }
                     }
+                    Some("quit") | Some("exit") => {
+                        let _ = cmd_tx.send(Command::Shutdown);
+                        break;
+                    }
+                    Some(other) => eprintln!(
+                        "unknown command {other:?}; use: acquire <lock> | release <lock> | quit"
+                    ),
+                    None => {}
                 }
-                Some("quit") | Some("exit") => {
-                    let _ = cmd_tx.send(Command::Shutdown);
-                    break;
-                }
-                Some(other) => eprintln!(
-                    "unknown command {other:?}; use: acquire <lock> | release <lock> | quit"
-                ),
-                None => {}
             }
-        }
-    });
+        });
+    }
 
     println!(
         "# node {id} of {} starting with {} codec",
         addrs.len(),
         codec.as_str()
     );
-    if let Err(e) = run_node_with_codec(id, addrs, codec, cmd_rx, evt_tx) {
+    if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
         eprintln!("node error: {e}");
         std::process::exit(1);
     }

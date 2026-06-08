@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codec::WireCodec;
-use crate::{Fence, LockId, Message, Node, NodeId};
+use crate::{Fence, LockId, Message, Node, NodeId, RENEW_INTERVAL};
 
 /// A command from the application to its local node.
 pub enum Command {
@@ -36,7 +36,7 @@ pub enum Command {
 }
 
 /// An event the node reports back to the application.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum NodeEvent {
     /// The lock is held; present `fence` to the protected resource.
     Acquired(LockId, Fence),
@@ -54,8 +54,38 @@ enum Ev {
     Tick,
 }
 
-const TICK: Duration = Duration::from_millis(500);
-const MAX_LINE_FRAME: usize = 1024 * 1024;
+const DEFAULT_TICK: Duration = Duration::from_millis(500);
+const DEFAULT_CONNECT_RETRY: Duration = Duration::from_millis(150);
+const DEFAULT_MAX_LINE_FRAME: usize = 1024 * 1024;
+
+/// Runtime settings for the TCP transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportSettings {
+    pub codec: WireCodec,
+    pub tick: Duration,
+    pub connect_retry: Duration,
+    pub max_line_frame: usize,
+}
+
+impl Default for TransportSettings {
+    fn default() -> Self {
+        Self {
+            codec: WireCodec::Text,
+            tick: DEFAULT_TICK,
+            connect_retry: DEFAULT_CONNECT_RETRY,
+            max_line_frame: DEFAULT_MAX_LINE_FRAME,
+        }
+    }
+}
+
+impl TransportSettings {
+    pub fn with_codec(codec: WireCodec) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
+    }
+}
 
 /// Run a node until it receives [`Command::Shutdown`]. Blocks the calling
 /// thread; spawns helper threads for I/O.
@@ -76,7 +106,25 @@ pub fn run_node_with_codec(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<NodeEvent>,
 ) -> std::io::Result<()> {
+    run_node_with_settings(
+        id,
+        addrs,
+        TransportSettings::with_codec(codec),
+        cmd_rx,
+        evt_tx,
+    )
+}
+
+/// Run a node with explicit TCP transport settings.
+pub fn run_node_with_settings(
+    id: NodeId,
+    addrs: Vec<String>,
+    settings: TransportSettings,
+    cmd_rx: Receiver<Command>,
+    evt_tx: Sender<NodeEvent>,
+) -> std::io::Result<()> {
     validate_config(id, &addrs)?;
+    validate_settings(settings)?;
     let n = addrs.len();
     let members: Vec<NodeId> = (0..n as NodeId).collect();
     let mut node = Node::new(id, members);
@@ -89,10 +137,11 @@ pub fn run_node_with_codec(
     let listener = TcpListener::bind(&addrs[id as usize])?;
     {
         let ev_tx = ev_tx.clone();
+        let max_line_frame = settings.max_line_frame;
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let ev_tx = ev_tx.clone();
-                thread::spawn(move || read_conn(stream, ev_tx));
+                thread::spawn(move || read_conn(stream, ev_tx, max_line_frame));
             }
         });
     }
@@ -101,11 +150,13 @@ pub fn run_node_with_codec(
     for peer in (0..n as NodeId).filter(|&p| p != id) {
         let addr = addrs[peer as usize].clone();
         let ev_tx = ev_tx.clone();
+        let retry = settings.connect_retry;
+        let codec = settings.codec;
         thread::spawn(move || loop {
             match TcpStream::connect(&addr) {
                 Ok(mut s) => {
                     if writeln!(s, "HELLO {id} {}", codec.as_str()).is_err() {
-                        thread::sleep(Duration::from_millis(150));
+                        thread::sleep(retry);
                         continue;
                     }
                     // Keep a read handle so we can notice when the peer closes
@@ -116,7 +167,7 @@ pub fn run_node_with_codec(
                     let monitor = match s.try_clone() {
                         Ok(m) => m,
                         Err(_) => {
-                            thread::sleep(Duration::from_millis(150));
+                            thread::sleep(retry);
                             continue;
                         }
                     };
@@ -133,7 +184,7 @@ pub fn run_node_with_codec(
                         }
                     }
                 }
-                Err(_) => thread::sleep(Duration::from_millis(150)),
+                Err(_) => thread::sleep(retry),
             }
         });
     }
@@ -141,8 +192,9 @@ pub fn run_node_with_codec(
     // Tick timer.
     {
         let ev_tx = ev_tx.clone();
+        let tick = settings.tick;
         thread::spawn(move || loop {
-            thread::sleep(TICK);
+            thread::sleep(tick);
             if ev_tx.send(Ev::Tick).is_err() {
                 return;
             }
@@ -172,7 +224,7 @@ pub fn run_node_with_codec(
                 writers.insert(peer, stream);
                 if let Some(buffered) = pending.remove(&peer) {
                     for msg in buffered {
-                        write_to(&mut writers, peer, codec, &msg);
+                        write_to(&mut writers, peer, settings.codec, &msg);
                     }
                 }
                 let _ = evt_tx.send(NodeEvent::Info(format!("connected to node {peer}")));
@@ -189,7 +241,7 @@ pub fn run_node_with_codec(
                 // Deliver to self in-process (still FIFO w.r.t. this node).
                 let _ = ev_tx.send(Ev::In(id, out.msg));
             } else if writers.contains_key(&out.to) {
-                write_to(&mut writers, out.to, codec, &out.msg);
+                write_to(&mut writers, out.to, settings.codec, &out.msg);
             } else {
                 pending.entry(out.to).or_default().push(out.msg);
             }
@@ -202,6 +254,26 @@ pub fn run_node_with_codec(
         }
     }
 
+    Ok(())
+}
+
+fn validate_settings(settings: TransportSettings) -> io::Result<()> {
+    if settings.tick.is_zero() {
+        return Err(invalid_input("tick interval must be greater than zero"));
+    }
+    if settings.tick.as_millis() > RENEW_INTERVAL as u128 {
+        return Err(invalid_input(
+            "tick interval must not exceed renew interval",
+        ));
+    }
+    if settings.connect_retry.is_zero() {
+        return Err(invalid_input(
+            "connect retry interval must be greater than zero",
+        ));
+    }
+    if settings.max_line_frame == 0 {
+        return Err(invalid_input("max line frame must be greater than zero"));
+    }
     Ok(())
 }
 
@@ -238,13 +310,13 @@ fn write_to(writers: &mut HashMap<NodeId, TcpStream>, to: NodeId, codec: WireCod
 }
 
 /// Read a connection: first `HELLO <id> [codec]`, then one message per line.
-fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>) {
+fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>, max_line_frame: usize) {
     let mut r = BufReader::new(stream);
     let mut line = String::new();
     if r.read_line(&mut line).is_err() {
         return;
     }
-    if line.len() > MAX_LINE_FRAME {
+    if line.len() > max_line_frame {
         return;
     }
     let mut hello = line.split_whitespace();
@@ -270,7 +342,7 @@ fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>) {
         match r.read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
-                if line.len() > MAX_LINE_FRAME {
+                if line.len() > max_line_frame {
                     return;
                 }
                 if let Some(msg) = codec.decode_line(line.trim()) {

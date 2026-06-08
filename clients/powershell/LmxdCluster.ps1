@@ -1,8 +1,10 @@
 # LmxdCluster.ps1 — PowerShell harness/client for the live-mutex-mills `lmxd` daemon.
 #
-# The Windows-shell companion to clients/shell. live-mutex-mills is leaderless —
-# there is no central server, so the client surface is the daemon's own
-# stdin/stdout protocol (README "Then type commands on stdin"):
+# The Windows-shell companion to clients/shell. live-mutex-mills is leaderless:
+# every node is a peer in a quorum/vote mesh. Modern `lmxd` can expose HTTP and
+# line-oriented TCP client listeners for language-neutral clients; this
+# lightweight harness keeps using the daemon's stdin/stdout protocol because it
+# needs no client dependencies:
 #
 #     stdin  : acquire <lock> | release <lock> | quit
 #     stdout : ACQUIRED <lock> fence=<n> | LOST <lock> | # <info>
@@ -28,7 +30,8 @@ class LmxdCluster {
 
     static [string] ResolveBin() {
         $repo = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
-        $exe = if ($IsWindows) { 'lmxd.exe' } else { 'lmxd' }
+        # $IsWindows is undefined on Windows PowerShell 5.1; $env:OS is portable.
+        $exe = if ($env:OS -eq 'Windows_NT') { 'lmxd.exe' } else { 'lmxd' }
         foreach ($p in @("target/release/$exe", "target/debug/$exe")) {
             $full = Join-Path $repo $p
             if (Test-Path $full) { return $full }
@@ -48,9 +51,10 @@ class LmxdCluster {
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
             $psi.UseShellExecute = $false
-            [void]$psi.ArgumentList.Add('--codec'); [void]$psi.ArgumentList.Add($this.Codec)
-            [void]$psi.ArgumentList.Add("$i")
-            foreach ($a in $addrs) { [void]$psi.ArgumentList.Add($a) }
+            # ProcessStartInfo.ArgumentList is .NET Core only; .Arguments is
+            # portable to Windows PowerShell 5.1. All tokens are space-free
+            # (codec name, integer id, host:port addrs), so a plain join is safe.
+            $psi.Arguments = (@('--codec', $this.Codec, "$i") + $addrs) -join ' '
 
             $sb = [System.Text.StringBuilder]::new()
             $p = [System.Diagnostics.Process]::new()
