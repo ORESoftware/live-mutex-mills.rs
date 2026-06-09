@@ -1,0 +1,49 @@
+# k3d (k3s-in-Docker) cluster for live-mutex-mills.rs (Rust broker, Maekawa-like cluster)
+#
+# Coexists with kind without stepping on its toes:
+#   - kind.yaml maps host ports 6970-6975; this maps 7970-7975 (no overlap).
+#   - kind uses context "kind-live-mutex-mills" + the "kind" docker network;
+#     k3d uses "k3d-live-mutex-mills" + its own network. API servers bind random
+#     host ports, so they never clash.
+# => a kind cluster and this k3d cluster can run at the same time.
+#
+# Usage:
+#   k3d cluster create --config k3d.yaml
+#   kubectl --context k3d-live-mutex-mills get nodes
+#   k3d cluster delete live-mutex-mills
+#
+# 1 server + 3 agents == a 3-node Maekawa peer mesh (node ids 0/1/2). Agents are
+# labelled lmx-node=node-0|node-1|node-2 (same scheme as kind.yaml) so the same
+# nodeSelector manifests work on either runtime. Peer-mesh traffic (9100-9102)
+# stays pod-to-pod and is not published to the host.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: live-mutex-mills
+servers: 1
+agents: 3
+ports:
+  - port: "7970:6970"
+    nodeFilters: ["agent:0"]
+  - port: "7971:6971"
+    nodeFilters: ["agent:0"]
+  - port: "7972:6970"
+    nodeFilters: ["agent:1"]
+  - port: "7973:6971"
+    nodeFilters: ["agent:1"]
+  - port: "7974:6970"
+    nodeFilters: ["agent:2"]
+  - port: "7975:6971"
+    nodeFilters: ["agent:2"]
+options:
+  k3s:
+    extraArgs:
+      - arg: "--disable=traefik"
+        nodeFilters: ["server:*"]
+    nodeLabels:
+      - label: "lmx-node=node-0"
+        nodeFilters: ["agent:0"]
+      - label: "lmx-node=node-1"
+        nodeFilters: ["agent:1"]
+      - label: "lmx-node=node-2"
+        nodeFilters: ["agent:2"]
