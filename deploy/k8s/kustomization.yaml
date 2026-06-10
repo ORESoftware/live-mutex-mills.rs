@@ -11,5 +11,7 @@ resources:
   - service-peers.yaml
   - service-client.yaml
   - statefulset.yaml
-commonLabels:
-  app.kubernetes.io/part-of: live-mutex-mills
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: live-mutex-mills
