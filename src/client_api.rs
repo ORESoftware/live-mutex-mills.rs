@@ -50,6 +50,27 @@ fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max: usize) -
     Ok(n)
 }
 
+/// A holder token authorizes releasing a lock, so it must be UNGUESSABLE: a
+/// sequential counter let any client on the same node release another client's
+/// lock by guessing the next id. This returns `<prefix>` + 128 random bits (hex)
+/// from the OS CSPRNG. `seq` is only used as a graceful fallback if the OS RNG is
+/// somehow unavailable (essentially never), so the token is still unique/non-empty.
+fn random_holder_token(prefix: &str, seq: u64) -> String {
+    use std::fmt::Write;
+    let mut bytes = [0u8; 16];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => {
+            let mut s = String::with_capacity(prefix.len() + 32);
+            s.push_str(prefix);
+            for b in bytes {
+                let _ = write!(s, "{:02x}", b);
+            }
+            s
+        }
+        Err(_) => format!("{prefix}{:016x}", seq),
+    }
+}
+
 /// Apply read/write timeouts so a slow or idle client cannot pin a thread.
 fn configure_client_socket(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
@@ -616,10 +637,8 @@ impl LockClient {
     }
 
     fn register_rw_bundle(&self, bundle: RwBundle) -> String {
-        let holder = format!(
-            "rw{:016x}",
-            self.next_rw_holder.fetch_add(1, Ordering::Relaxed)
-        );
+        let holder =
+            random_holder_token("rw", self.next_rw_holder.fetch_add(1, Ordering::Relaxed));
         self.rw_holders
             .lock()
             .expect("rw holder map poisoned")
@@ -865,7 +884,7 @@ fn grant_next_waiter(
     cmd_tx: &Sender<Command>,
 ) {
     while let Some(waiter) = queue.waiters.pop_front() {
-        let token = format!("h{:016x}", *next_holder);
+        let token = random_holder_token("h", *next_holder);
         *next_holder += 1;
         let acquired = ClientAcquire {
             lock: waiter.resource.client_lock(),
