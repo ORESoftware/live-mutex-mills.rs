@@ -25,10 +25,28 @@ spec:
         app: live-mutex-mills
     spec:
       terminationGracePeriodSeconds: 5
+      # Hardening: the broker needs no Kubernetes API access, no privileges, and
+      # no writable filesystem (in-memory only). Matches the raft gold standard.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: lmxd
           image: live-mutex-mills:dev
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: peer
               containerPort: 9000

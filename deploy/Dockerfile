@@ -32,7 +32,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/lmxd /usr/local/bin/lmxd
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0555 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/lmxd
+
+# Run as a non-root, unprivileged numeric UID (no shell, no home needed). lmxd
+# binds only high ports (9000/6971), holds no on-disk state, and the entrypoint
+# only reads DNS — so this works with a read-only root filesystem too (see the
+# StatefulSet securityContext).
+USER 65532:65532
 
 # 9000 = peer mesh; 6971 = client HTTP API.
 EXPOSE 9000 6971
