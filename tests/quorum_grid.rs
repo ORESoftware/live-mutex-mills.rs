@@ -144,6 +144,61 @@ fn grid_single_lock_all_nodes_contend_many_seeds() {
     }
 }
 
+#[test]
+fn grid_quorum_is_order_independent_and_still_intersects() {
+    // C2 hardening: the grid must be a function of the member SET, not input
+    // order — else two nodes that received the member list in different orders
+    // could build disjoint quorums and both hold the lock. We sort internally,
+    // so any ordering yields the same grid, and quorums computed by nodes using
+    // DIFFERENT orderings still intersect.
+    for &n in &[4usize, 5, 9, 16, 25] {
+        let asc: Vec<NodeId> = (0..n as NodeId).collect();
+        let desc: Vec<NodeId> = (0..n as NodeId).rev().collect();
+        // order independence
+        for id in 0..n as NodeId {
+            let a: HashSet<NodeId> = grid_quorum(id, &asc).into_iter().collect();
+            let d: HashSet<NodeId> = grid_quorum(id, &desc).into_iter().collect();
+            assert_eq!(a, d, "n={n}: grid_quorum({id}) depends on input order");
+        }
+        // cross-order intersection (node i used asc, node j used desc)
+        for i in 0..n as NodeId {
+            let qi: HashSet<NodeId> = grid_quorum(i, &asc).into_iter().collect();
+            for j in 0..n as NodeId {
+                let qj: HashSet<NodeId> = grid_quorum(j, &desc).into_iter().collect();
+                assert!(
+                    qi.intersection(&qj).next().is_some(),
+                    "n={n}: Q_{i}(asc) and Q_{j}(desc) are disjoint — order drift would double-grant",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grid_line_outage_wedges_some_nodes_expected_tradeoff() {
+    // M2 / design §2: grid is LESS available than majority for a full row/column
+    // outage. n=9 (3×3); crash column {2,5,8} — only 3 of 9 (a minority a
+    // majority quorum would survive). Node 0's quorum is {0,1,2,3,6} and needs
+    // node 2, so it can NEVER acquire. We assert this expected unavailability so
+    // the tradeoff is encoded, not a surprise.
+    use live_mutex_mills::LEASE;
+    let mut sim = Sim::with_seed_policy(9, 5, QuorumPolicy::Grid);
+    for dead in [2u32, 5, 8] {
+        sim.crash(dead);
+    }
+    sim.request(0, "A");
+    sim.advance(LEASE * 3);
+    for _ in 0..5000 {
+        if !sim.step() {
+            break;
+        }
+    }
+    assert!(
+        sim.drain_acquired().is_empty(),
+        "node 0's grid quorum needs a node in the dead column; it must NOT acquire",
+    );
+}
+
 fn grid_step_until_acquired(sim: &mut Sim, node: NodeId, lock: &str) -> Fence {
     for _ in 0..100_000 {
         for (n, l, fence) in sim.drain_acquired() {

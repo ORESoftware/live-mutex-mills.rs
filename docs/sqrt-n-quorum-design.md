@@ -179,20 +179,37 @@ implementation enforces what it can locally; the rest are deployment rules.
 
 1. **The policy MUST be uniform across the whole cluster.** A grid quorum
    (≈2√n−1 nodes) and a majority quorum (>n/2 nodes) are **not guaranteed to
-   intersect** — for large n, |Q_grid| + |Q_majority| < n+1, so two holders
-   (one acquired via grid, one via majority) could both hold. Therefore you may
-   **not** run some nodes on `majority` and others on `grid`, and you may **not**
-   switch policy via a rolling update (which transiently mixes them). Changing
-   policy requires draining all locks and restarting the whole cluster on the new
-   policy. (The k8s `LMX_QUORUM_POLICY` env is set cluster-wide on the
-   StatefulSet, so steady state is uniform; the hazard is only during a
-   policy-changing rollout.)
+   intersect** — for large n (n=7 and every n≥10), a majority set can be fully
+   disjoint from some grid quorum, so two holders (one via grid, one via
+   majority) could both hold AND mint the same fence token (the backstop does
+   not save you). Therefore you may **not** run mixed policies, and you may
+   **not** switch policy via a rolling update (which transiently mixes them).
 
-2. **All nodes MUST build the grid from the same member list in the same order.**
-   `grid_quorum` maps members→cells by their index in the ordered member list; if
-   two nodes disagree on the order, their grids can fail to intersect. The daemon
-   guarantees this (membership is the positional peer-address list, identical on
-   every node). Don't hand different orders to different nodes.
+   **This cannot be made safe by any local (per-node) protocol rule** — mixed
+   policy partitions the nodes into policy-consistent groups whose quorums can be
+   disjoint, and no arbiter-side check fixes that without *global* agreement on
+   the active policy. So uniformity is enforced by **operational discipline**
+   today, and robustly only by a future **config epoch owned by the raft brain**
+   (§6): a node operates at the highest epoch it has confirmed with an
+   intersecting quorum, and policy changes advance the epoch through an
+   overlapping-quorum transition. Until then:
+   - the k8s `LMX_QUORUM_POLICY` env is set cluster-wide on the StatefulSet, so
+     steady state is uniform; the hazard window is only a policy-changing rollout;
+   - to change policy, **drain locks and restart all pods at once** (scale to 0,
+     change the value, scale back up) — never a rolling update;
+   - each node **logs its policy at startup** (`# node N of M … quorum Grid`), so
+     a mismatch is detectable in logs/monitoring.
+
+2. **Member-list order is canonicalized (ENFORCED).** Earlier this was an
+   unenforced precondition: `grid_quorum` mapped members→cells by their index in
+   the *input* list, so two nodes that received the membership in different orders
+   (differently-sorted env, DNS SRV reordering, a hand-edited `addrs`) could build
+   **disjoint** quorums and both hold the lock. Fixed: `grid_quorum`/`gridQuorum`
+   now **sort the membership set** before placing it in the grid, so the layout is
+   a function of the set, not the input order — every node computes the identical
+   grid regardless of how it received the list. (TS sorts numerically, not the JS
+   default lexicographic sort.) Tested by
+   `grid_quorum_is_order_independent_and_still_intersects` in both engines.
 
 3. **Membership is fixed.** Grid quorums assume a fixed member set (same as the
    majority path today). Dynamic membership needs one-at-a-time reconfiguration

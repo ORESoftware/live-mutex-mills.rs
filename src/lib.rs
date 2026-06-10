@@ -209,14 +209,22 @@ fn grid_side(n: usize) -> usize {
 }
 
 /// The √n grid quorum for `id`: every member sharing its row or its column when
-/// `members` are packed row-major into a `ceil(√n) × ceil(√n)` grid. Includes
-/// `id` itself. Deterministic from the *ordered* member list, so every node
-/// computes the identical grid with no coordination. Order is row-then-column,
-/// de-duplicated (the shared row/column cell appears once).
+/// the membership is packed row-major into a `ceil(√n) × ceil(√n)` grid. Includes
+/// `id` itself.
+///
+/// The grid is a function of the membership **set**, NOT the order of the input
+/// slice: `members` is sorted internally before being placed in the grid. This
+/// is a SAFETY requirement — if two nodes built grids from differently-ordered
+/// member lists, their row∪column quorums could fail to intersect and both could
+/// hold the same lock. Sorting makes every node compute the identical grid with
+/// no coordination, regardless of how it received the member list.
 pub fn grid_quorum(id: NodeId, members: &[NodeId]) -> Vec<NodeId> {
     let n = members.len();
     let side = grid_side(n);
-    let idx = members
+    // Canonical, order-independent layout: sort the membership set first.
+    let mut sorted: Vec<NodeId> = members.to_vec();
+    sorted.sort_unstable();
+    let idx = sorted
         .iter()
         .position(|&m| m == id)
         .expect("id must be a member");
@@ -225,14 +233,14 @@ pub fn grid_quorum(id: NodeId, members: &[NodeId]) -> Vec<NodeId> {
     let mut seen: HashSet<NodeId> = HashSet::new();
     for c in 0..side {
         let i = row * side + c;
-        if i < n && seen.insert(members[i]) {
-            q.push(members[i]);
+        if i < n && seen.insert(sorted[i]) {
+            q.push(sorted[i]);
         }
     }
     for r in 0..side {
         let i = r * side + col;
-        if i < n && seen.insert(members[i]) {
-            q.push(members[i]);
+        if i < n && seen.insert(sorted[i]) {
+            q.push(sorted[i]);
         }
     }
     q
