@@ -207,9 +207,10 @@ fn main() {
     }
 
     println!(
-        "# node {id} of {} starting with {} codec",
+        "# node {id} of {} starting with {} codec, quorum {:?}",
         addrs.len(),
-        codec.as_str()
+        codec.as_str(),
+        transport.quorum_policy
     );
     if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
         eprintln!("node error: {e}");

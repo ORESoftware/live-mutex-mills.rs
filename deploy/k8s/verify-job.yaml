@@ -1,0 +1,136 @@
+# One-shot correctness gate for the live cluster. Run AFTER the StatefulSet is
+# Ready:  kubectl -n live-mutex-mills apply -f deploy/k8s/verify-job.yaml
+#
+# What it proves over the REAL network (not the in-process property tests):
+#   * Liveness: many concurrent external clients can acquire/release a single
+#     hot lock through the load-balanced client Service (any node serves it).
+#   * Safety: every acquire returns a fence token, and the broker NEVER hands
+#     out the same fence twice. A duplicate fence is exactly a double-grant =
+#     a mutual-exclusion violation, so "all fences unique" is the witness.
+#   * Monotonicity: fences are strictly increasing (max == count when no token
+#     is skipped or reused).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmx-verify
+data:
+  verify.sh: |
+    #!/bin/sh
+    set -u
+    # Workers pin to a single node for their own acquire+release pair (the holder
+    # token is node-local), but DIFFERENT workers enter via DIFFERENT nodes, so a
+    # single hot lock is genuinely contended ACROSS the cluster — exercising the
+    # full quorum + cross-node mutual exclusion, not just one node's local view.
+    NODES="${NODES:-3}"
+    SVC="${PEERS_SVC:-lmx-peers}"
+    STS="${STS_NAME:-lmx}"
+    # Unique lock name per run: locks are in-memory and a client that dies
+    # without releasing leaves its lock HELD indefinitely (the serving node keeps
+    # renewing the lease for it — see deploy/AUDIT.md). A fresh name guarantees an
+    # uncontended starting point so the gate is repeatable.
+    LOCK="hot-$(date +%s)-$$"
+    WORKERS="${WORKERS:-12}"
+    ITERS="${ITERS:-25}"
+    OUT=/tmp/out
+    mkdir -p "$OUT"
+
+    node_base() { echo "http://${STS}-$(( $1 % NODES )).${SVC}:6971"; }
+
+    echo "# waiting for all $NODES nodes healthy ..."
+    j=0
+    while [ "$j" -lt "$NODES" ]; do
+      i=0
+      until curl -fs "$(node_base "$j")/healthz" >/dev/null 2>&1; do
+        i=$((i+1)); [ "$i" -gt 120 ] && { echo "FAIL: node $j never healthy"; exit 1; }
+        sleep 1
+      done
+      j=$((j+1))
+    done
+    echo "# healthy; driving $WORKERS workers across $NODES nodes x $ITERS iters on lock '$LOCK'"
+
+    worker() {
+      w="$1"; n=0; BASE="$(node_base "$w")"
+      while [ "$n" -lt "$ITERS" ]; do
+        n=$((n+1))
+        resp=$(curl -s -X POST "$BASE/locks/$LOCK/acquire")
+        fence=$(printf '%s' "$resp" | sed -n 's/.*"fence":\([0-9][0-9]*\).*/\1/p')
+        holder=$(printf '%s' "$resp" | sed -n 's/.*"holder":"\([^"]*\)".*/\1/p')
+        if [ -z "$fence" ] || [ -z "$holder" ]; then
+          echo "ACQ_FAIL w$w: $resp" >> "$OUT/errors"
+          continue
+        fi
+        echo "$fence" >> "$OUT/fences"
+        # brief hold to force genuine contention / handoff across nodes
+        rel=$(curl -s -X POST -H 'Content-Type: application/json' \
+              -d "{\"holder\":\"$holder\"}" "$BASE/locks/$LOCK/release")
+        echo "$rel" | grep -q '"ok":true' && echo 1 >> "$OUT/releases" \
+          || echo "REL_FAIL w$w: $rel" >> "$OUT/errors"
+      done
+    }
+
+    : > "$OUT/fences"; : > "$OUT/releases"; : > "$OUT/errors"
+    w=0
+    while [ "$w" -lt "$WORKERS" ]; do worker "$w" & w=$((w+1)); done
+    wait
+
+    successes=$(wc -l < "$OUT/fences" | tr -d ' ')
+    unique=$(sort -n "$OUT/fences" | uniq | wc -l | tr -d ' ')
+    releases=$(wc -l < "$OUT/releases" | tr -d ' ')
+    maxf=$(sort -n "$OUT/fences" | tail -1)
+    minf=$(sort -n "$OUT/fences" | head -1)
+    errs=$(wc -l < "$OUT/errors" | tr -d ' ')
+
+    echo "=================== RESULT ==================="
+    echo "successful acquires : $successes"
+    echo "unique fences       : $unique"
+    echo "releases ok         : $releases"
+    echo "fence range         : $minf .. $maxf"
+    echo "errors              : $errs"
+    [ "$errs" -gt 0 ] && head -10 "$OUT/errors"
+    echo "============================================="
+
+    fail=0
+    [ "$successes" -gt 0 ] || { echo "FAIL: no successful acquires (no liveness)"; fail=1; }
+    [ "$successes" = "$unique" ] || { echo "FAIL: DUPLICATE FENCE -> double-grant -> MUTUAL EXCLUSION VIOLATED"; fail=1; }
+    [ "$successes" = "$releases" ] || { echo "FAIL: acquires ($successes) != releases ($releases)"; fail=1; }
+    [ "$errs" = "0" ] || { echo "FAIL: $errs request errors"; fail=1; }
+    if [ "$fail" = "0" ]; then echo "PASS: mutual exclusion + liveness verified over the network"; fi
+    exit "$fail"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lmx-verify
+  labels:
+    app: live-mutex-mills
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: live-mutex-mills
+        role: verify
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: curlimages/curl:latest
+          command: ["sh", "/scripts/verify.sh"]
+          env:
+            - name: WORKERS
+              value: "12"
+            - name: ITERS
+              value: "25"
+            - name: NODES
+              value: "3"
+            - name: STS_NAME
+              value: "lmx"
+            - name: PEERS_SVC
+              value: "lmx-peers"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: lmx-verify

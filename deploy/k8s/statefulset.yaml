@@ -1,0 +1,81 @@
+# The lmxd peer mesh. A StatefulSet (not a Deployment) because the protocol's
+# membership is fixed and positional: each node's id is its ordinal, and every
+# node must have a stable, predictable network identity so the others can dial
+# it. podManagementPolicy: Parallel starts all pods at once so the mesh can form
+# without waiting for ordered readiness (every node dials every other node).
+#
+# NOTE: spec.replicas and the LMX_REPLICAS env var MUST stay in sync — they are
+# the same N. The kustomization keeps them together in one file for that reason.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lmx
+  labels:
+    app: live-mutex-mills
+spec:
+  serviceName: lmx-peers
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: live-mutex-mills
+  template:
+    metadata:
+      labels:
+        app: live-mutex-mills
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: lmxd
+          image: live-mutex-mills:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: peer
+              containerPort: 9000
+            - name: http
+              containerPort: 6971
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LMX_PEERS_SVC
+              value: lmx-peers
+            - name: LMX_REPLICAS
+              value: "3"            # keep equal to spec.replicas
+            - name: LMX_PEER_PORT
+              value: "9000"
+            - name: LMX_CLIENT_HTTP_PORT
+              value: "6971"
+            - name: LMX_LOG_INFO
+              value: "on"
+            # Quorum policy: "majority" (floor(n/2)+1, O(n) msgs) or "grid"
+            # (√n Maekawa row∪column, O(√n) msgs). For a meaningful grid set
+            # replicas to a square (e.g. 9 → 3×3) and bump LMX_REPLICAS to match.
+            - name: LMX_QUORUM_POLICY
+              value: "majority"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

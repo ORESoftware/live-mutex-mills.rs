@@ -177,6 +177,62 @@ struct RequesterState {
     next_renew: Instant,
 }
 
+/// How a requester chooses which arbiters to collect votes from, and how many it
+/// needs. Safety in every policy rests on the same invariant: any two
+/// requesters' fully-granted vote sets must intersect, so a single arbiter would
+/// have to grant its one vote twice — impossible. Only the *shape* of the quorum
+/// differs. See `docs/sqrt-n-quorum-design.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuorumPolicy {
+    /// v1 behavior: ask every member, acquire on a strict majority
+    /// (`floor(n/2) + 1`). Any two majorities intersect. O(n) messages.
+    Majority,
+    /// √n grid (true Maekawa): pack members row-major into a
+    /// `ceil(√n) × ceil(√n)` grid; a node's quorum is its row ∪ column
+    /// (≈ 2√n − 1 nodes, *all* of which must grant). Any two row∪column sets
+    /// intersect (one's row crosses the other's column). O(√n) messages.
+    Grid,
+}
+
+/// `ceil(sqrt(n))` via integer arithmetic (no float rounding surprises).
+fn grid_side(n: usize) -> usize {
+    let mut side = 1usize;
+    while side * side < n {
+        side += 1;
+    }
+    side
+}
+
+/// The √n grid quorum for `id`: every member sharing its row or its column when
+/// `members` are packed row-major into a `ceil(√n) × ceil(√n)` grid. Includes
+/// `id` itself. Deterministic from the *ordered* member list, so every node
+/// computes the identical grid with no coordination. Order is row-then-column,
+/// de-duplicated (the shared row/column cell appears once).
+pub fn grid_quorum(id: NodeId, members: &[NodeId]) -> Vec<NodeId> {
+    let n = members.len();
+    let side = grid_side(n);
+    let idx = members
+        .iter()
+        .position(|&m| m == id)
+        .expect("id must be a member");
+    let (row, col) = (idx / side, idx % side);
+    let mut q: Vec<NodeId> = Vec::new();
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for c in 0..side {
+        let i = row * side + c;
+        if i < n && seen.insert(members[i]) {
+            q.push(members[i]);
+        }
+    }
+    for r in 0..side {
+        let i = r * side + col;
+        if i < n && seen.insert(members[i]) {
+            q.push(members[i]);
+        }
+    }
+    q
+}
+
 /// A single node's protocol state machine. Pure logic — no I/O, no clocks.
 ///
 /// Drive it by calling [`Node::request`]/[`Node::release`] to express intent,
@@ -185,8 +241,15 @@ struct RequesterState {
 /// node has just entered (with their fence token).
 pub struct Node {
     pub id: NodeId,
+    /// Full cluster membership (used for sender validation and grid construction).
     members: Vec<NodeId>,
-    quorum: usize,
+    /// The arbiters this node, as a *requester*, asks for votes and renews/releases
+    /// at. Majority policy → all members; Grid policy → this node's row∪column.
+    targets: Vec<NodeId>,
+    /// Grants needed to enter the critical section. Majority → `floor(n/2)+1`;
+    /// Grid → `targets.len()` (every node in the quorum set must grant).
+    threshold: usize,
+    policy: QuorumPolicy,
     lamport: Lamport,
     arbiter: HashMap<LockId, ArbiterState>,
     requester: HashMap<LockId, RequesterState>,
@@ -198,10 +261,17 @@ pub struct Node {
 }
 
 impl Node {
-    /// Create a node. `members` is the full cluster membership (including
-    /// `id`) with no duplicates. The quorum is a strict majority:
-    /// `floor(n/2) + 1`.
+    /// Create a node with the default [`QuorumPolicy::Majority`] (unchanged v1
+    /// behavior). `members` is the full cluster membership (including `id`) with
+    /// no duplicates.
     pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
+        Self::with_policy(id, members, QuorumPolicy::Majority)
+    }
+
+    /// Create a node with an explicit [`QuorumPolicy`]. The policy only changes
+    /// the *requester* side (which arbiters to ask and how many grants to wait
+    /// for); the arbiter side, leases, fencing, and INQUIRE/YIELD are identical.
+    pub fn with_policy(id: NodeId, members: Vec<NodeId>, policy: QuorumPolicy) -> Self {
         assert!(!members.is_empty(), "members must not be empty");
         assert!(
             members.contains(&id),
@@ -209,11 +279,20 @@ impl Node {
         );
         let unique: HashSet<NodeId> = members.iter().copied().collect();
         assert_eq!(unique.len(), members.len(), "members must be unique");
-        let quorum = members.len() / 2 + 1;
+        let (targets, threshold) = match policy {
+            QuorumPolicy::Majority => (members.clone(), members.len() / 2 + 1),
+            QuorumPolicy::Grid => {
+                let q = grid_quorum(id, &members);
+                let t = q.len();
+                (q, t)
+            }
+        };
         Node {
             id,
             members,
-            quorum,
+            targets,
+            threshold,
+            policy,
             lamport: 0,
             arbiter: HashMap::new(),
             requester: HashMap::new(),
@@ -224,13 +303,26 @@ impl Node {
         }
     }
 
-    /// The quorum size (`floor(n/2) + 1`).
+    /// The number of grants this node needs to hold a lock (the quorum
+    /// threshold): `floor(n/2)+1` under Majority, `|row∪col|` under Grid.
     pub fn quorum_size(&self) -> usize {
-        self.quorum
+        self.threshold
     }
 
-    /// Begin acquiring `lock`. Broadcasts a vote request to every member
-    /// (including self). The lock is held once [`Node::take_acquired`] reports
+    /// The arbiters this node collects votes from (all members under Majority;
+    /// the node's row∪column under Grid). Useful for tests and introspection.
+    pub fn quorum_members(&self) -> &[NodeId] {
+        &self.targets
+    }
+
+    /// This node's quorum policy.
+    pub fn policy(&self) -> QuorumPolicy {
+        self.policy
+    }
+
+    /// Begin acquiring `lock`. Sends a vote request to this node's quorum
+    /// (every member under Majority; its row∪column under Grid — always
+    /// including self). The lock is held once [`Node::take_acquired`] reports
     /// it. Re-requesting a lock already being acquired/held is idempotent.
     pub fn request(&mut self, now: Instant, lock: &str) {
         self.now = now;
@@ -249,7 +341,7 @@ impl Node {
                 next_renew: now + RENEW_INTERVAL,
             },
         );
-        for m in self.members.clone() {
+        for m in self.targets.clone() {
             self.send(
                 m,
                 Message::Request {
@@ -267,7 +359,7 @@ impl Node {
         self.now = now;
         if let Some(state) = self.requester.remove(lock) {
             let fence = state.best_fence;
-            for m in self.members.clone() {
+            for m in self.targets.clone() {
                 self.send(
                     m,
                     Message::Release {
@@ -338,7 +430,7 @@ impl Node {
         // the RequestId is unchanged, so queue fairness is preserved. (A lost
         // Grant self-heals separately — the arbiter's vote lease lapses and it
         // re-grants.) Without this a one-shot message loss wedges the requester.
-        let quorum = self.quorum;
+        let quorum = self.threshold;
         let mut renews: Vec<(NodeId, LockId, RequestId)> = Vec::new();
         let mut rebroadcasts: Vec<(LockId, RequestId)> = Vec::new();
         for (lock, r) in self.requester.iter_mut() {
@@ -356,7 +448,7 @@ impl Node {
             self.send(to, Message::Renew { lock, req });
         }
         if !rebroadcasts.is_empty() {
-            let members = self.members.clone();
+            let members = self.targets.clone();
             for (lock, req) in rebroadcasts {
                 for &m in &members {
                     self.send(m, Message::Request { lock: lock.clone(), req });
@@ -565,7 +657,7 @@ impl Node {
     // ---- requester role --------------------------------------------------
 
     fn on_grant(&mut self, from: NodeId, lock: LockId, req: RequestId, fence: Fence) {
-        let quorum = self.quorum;
+        let quorum = self.threshold;
         let mut confirm: Vec<NodeId> = Vec::new();
         let mut token: Fence = 0;
         let mut newly_acquired: Option<Fence> = None;
@@ -655,7 +747,7 @@ impl Node {
     /// Requester: an arbiter reclaimed our vote. Drop it; if that drops us below
     /// quorum while we believed we held the lock, we have lost it.
     fn on_revoked(&mut self, from: NodeId, lock: LockId, req: RequestId) {
-        let quorum = self.quorum;
+        let quorum = self.threshold;
         let mut lost = false;
         if let Some(r) = self.requester.get_mut(&lock) {
             if r.req != req {
@@ -672,7 +764,7 @@ impl Node {
                 .remove(&lock)
                 .expect("requester state existed when loss was detected");
             let fence = state.best_fence;
-            for m in self.members.clone() {
+            for m in self.targets.clone() {
                 self.send(
                     m,
                     Message::Release {

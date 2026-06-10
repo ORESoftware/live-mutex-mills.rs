@@ -1,0 +1,22 @@
+# Headless Service that gives each StatefulSet pod a stable DNS name:
+#   lmx-<ordinal>.lmx-peers.<namespace>.svc.cluster.local
+#
+# clusterIP: None  -> headless (DNS returns pod IPs directly).
+# publishNotReadyAddresses: true -> peers are resolvable BEFORE they pass their
+#   readiness probe, so the mesh can form during startup (every node needs to
+#   dial every other node, and lmxd must resolve its own name to bind).
+apiVersion: v1
+kind: Service
+metadata:
+  name: lmx-peers
+  labels:
+    app: live-mutex-mills
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: live-mutex-mills
+  ports:
+    - name: peer
+      port: 9000
+      targetPort: peer

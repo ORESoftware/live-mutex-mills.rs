@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codec::WireCodec;
-use crate::{Fence, LockId, Message, Node, NodeId, RENEW_INTERVAL};
+use crate::{Fence, LockId, Message, Node, NodeId, QuorumPolicy, RENEW_INTERVAL};
 
 /// A command from the application to its local node.
 pub enum Command {
@@ -65,6 +65,8 @@ pub struct TransportSettings {
     pub tick: Duration,
     pub connect_retry: Duration,
     pub max_line_frame: usize,
+    /// Quorum policy for the requester role (Majority by default; Grid = √n).
+    pub quorum_policy: QuorumPolicy,
 }
 
 impl Default for TransportSettings {
@@ -74,6 +76,7 @@ impl Default for TransportSettings {
             tick: DEFAULT_TICK,
             connect_retry: DEFAULT_CONNECT_RETRY,
             max_line_frame: DEFAULT_MAX_LINE_FRAME,
+            quorum_policy: QuorumPolicy::Majority,
         }
     }
 }
@@ -127,7 +130,7 @@ pub fn run_node_with_settings(
     validate_settings(settings)?;
     let n = addrs.len();
     let members: Vec<NodeId> = (0..n as NodeId).collect();
-    let mut node = Node::new(id, members);
+    let mut node = Node::with_policy(id, members, settings.quorum_policy);
     let start = Instant::now();
     let now = move || start.elapsed().as_millis() as u64;
 

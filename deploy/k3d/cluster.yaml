@@ -1,0 +1,21 @@
+# Declarative k3d cluster (real k8s via k3s-in-docker). One server + two agents
+# so the three lmxd pods land on different nodes and the mesh is exercised over
+# genuine cross-node container networking — the same shape we deploy to the EC2
+# kubeadm cluster later (#4), so these manifests carry over almost verbatim.
+#
+#   k3d cluster create --config deploy/k3d/cluster.yaml
+#   k3d image import live-mutex-mills:dev -c live-mutex-mills
+#
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: live-mutex-mills
+servers: 1
+agents: 2
+options:
+  k3d:
+    wait: true
+    timeout: "120s"
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

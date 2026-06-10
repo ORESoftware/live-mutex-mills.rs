@@ -1,0 +1,28 @@
+# Client-facing Service for the HTTP lock API. Any node can serve any lock
+# (the lock STATE is distributed across the quorum), BUT the opaque `holder`
+# token returned by acquire is node-local: a client must send the matching
+# `release` to the SAME node that served its `acquire`. So this Service uses
+# sessionAffinity: ClientIP to pin a given source IP to one backend pod for the
+# duration of an acquire/release handshake. Clients reach it at:
+#   http://lmx-client.<namespace>.svc.cluster.local:6971
+#
+# (Clients that want to deliberately spread across nodes should address pods
+#  directly via the headless Service: lmx-<ordinal>.lmx-peers:6971.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: lmx-client
+  labels:
+    app: live-mutex-mills
+spec:
+  type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  selector:
+    app: live-mutex-mills
+  ports:
+    - name: http
+      port: 6971
+      targetPort: http

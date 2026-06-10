@@ -36,6 +36,12 @@ short = "a"
 type = "string"
 help = "Comma-separated broker peer address list. Positional addresses are still accepted."
 
+[flags.quorum-policy]
+env = "LMX_QUORUM_POLICY"
+aliases = ["quorum-policy", "quorum"]
+type = "string"
+help = "Requester quorum policy: 'majority' (default, floor(n/2)+1) or 'grid' (sqrt(n) Maekawa row-union-column)."
+
 [flags.client-http]
 env = "LMX_CLIENT_HTTP"
 aliases = ["http-client"]

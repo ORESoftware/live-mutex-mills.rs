@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::codec::WireCodec;
 use crate::composite::Composite;
 use crate::transport::TransportSettings;
-use crate::{NodeId, RENEW_INTERVAL};
+use crate::{NodeId, QuorumPolicy, RENEW_INTERVAL};
 
 pub const USAGE: &str = "usage: lmxd [--codec text|json|msgpack] [--client-http addr] [--client-tcp addr] <my_id> <addr_0> <addr_1> ... <addr_{n-1}>";
 
@@ -30,6 +30,7 @@ pub const ENV_LOG_INFO: &str = "LMX_LOG_INFO";
 pub const ENV_CONNECT_RETRY_MS: &str = "LMX_CONNECT_RETRY_MS";
 pub const ENV_TICK_MS: &str = "LMX_TICK_MS";
 pub const ENV_MAX_FRAME_BYTES: &str = "LMX_MAX_FRAME_BYTES";
+pub const ENV_QUORUM_POLICY: &str = "LMX_QUORUM_POLICY";
 pub const ENV_DEMO: &str = "LMX_DEMO";
 pub const ENV_DEMO_KEYS: &str = "LMX_DEMO_KEYS";
 pub const ENV_DEMO_HOLD_MS: &str = "LMX_DEMO_HOLD_MS";
@@ -225,6 +226,7 @@ pub enum BrokerRuntimeConfigError {
         peers: usize,
     },
     InvalidCodec(String),
+    InvalidQuorumPolicy(String),
     InvalidBool {
         env: &'static str,
         value: String,
@@ -289,6 +291,9 @@ impl fmt::Display for BrokerRuntimeConfigError {
             }
             Self::InvalidCodec(raw) => {
                 write!(f, "unknown codec {raw:?}; use text, json, or msgpack")
+            }
+            Self::InvalidQuorumPolicy(raw) => {
+                write!(f, "unknown quorum policy {raw:?}; use majority or grid")
             }
             Self::InvalidBool { env, value } => write!(
                 f,
@@ -565,6 +570,20 @@ fn parse_codec(raw: &str) -> Result<WireCodec, BrokerRuntimeConfigError> {
     WireCodec::parse(raw).ok_or_else(|| BrokerRuntimeConfigError::InvalidCodec(raw.to_string()))
 }
 
+fn parse_quorum_policy(
+    cli: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+) -> Result<QuorumPolicy, BrokerRuntimeConfigError> {
+    match setting(cli, env, ENV_QUORUM_POLICY) {
+        None => Ok(QuorumPolicy::Majority),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "majority" | "maj" => Ok(QuorumPolicy::Majority),
+            "grid" | "sqrt" | "maekawa" => Ok(QuorumPolicy::Grid),
+            _ => Err(BrokerRuntimeConfigError::InvalidQuorumPolicy(raw)),
+        },
+    }
+}
+
 fn parse_node_id(raw: &str) -> Result<NodeId, BrokerRuntimeConfigError> {
     raw.parse::<NodeId>()
         .map_err(|_| BrokerRuntimeConfigError::InvalidNodeId(raw.to_string()))
@@ -673,6 +692,7 @@ fn parse_transport(
             MIN_MAX_FRAME_BYTES,
             MAX_MAX_FRAME_BYTES,
         )?,
+        quorum_policy: parse_quorum_policy(cli, env)?,
     })
 }
 

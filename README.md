@@ -185,9 +185,6 @@ failover fencing is strictly monotonic (see `tests/failover.rs`).
 - **Dynamic membership.** Quorum is `floor(n/2)+1` of a *fixed* member set.
   Changing membership safely needs one-at-a-time reconfiguration (so old and new
   quorums always overlap).
-- **√n quorums (true Maekawa).** v1 broadcasts to all and needs a majority
-  (`O(n)` messages). Grid/√n quorums cut that to `O(√n)` at the cost of a more
-  delicate intersection structure.
 - **Model checking.** The preemption/eviction logic is the subtle part; a TLA+
   or `loom`-style exhaustive check of the safety invariant would be worthwhile.
 
@@ -198,6 +195,12 @@ failover fencing is strictly monotonic (see `tests/failover.rs`).
 - ✅ TCP transport + `lmxd` daemon, verified across processes.
 - ✅ External HTTP/TCP client APIs for exclusive locks, bounded semaphores, and
   bounded-reader RW locks.
+- ✅ **√n grid quorums (true Maekawa).** Opt-in via `--quorum-policy grid` /
+  `LMX_QUORUM_POLICY=grid` (default stays majority). Each node's quorum is its
+  row∪column in a `ceil(√n)×ceil(√n)` grid (≈2√n−1 nodes, `O(√n)` messages);
+  any two quorums intersect, so mutual exclusion is preserved. Proven in
+  `tests/quorum_grid.rs`; see `docs/sqrt-n-quorum-design.md` (incl. the
+  availability trade-off vs majority).
 
 ## Design provenance
 

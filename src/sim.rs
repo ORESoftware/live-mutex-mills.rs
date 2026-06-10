@@ -45,12 +45,19 @@ impl Sim {
     }
 
     /// Build an `n`-node cluster with an explicit PRNG seed (for reproducible
-    /// delivery orders across test cases).
+    /// delivery orders across test cases). Uses the default
+    /// [`QuorumPolicy::Majority`].
     pub fn with_seed(n: usize, seed: u64) -> Self {
+        Self::with_seed_policy(n, seed, crate::QuorumPolicy::Majority)
+    }
+
+    /// Build an `n`-node cluster with an explicit seed and [`QuorumPolicy`], so
+    /// the same property tests can exercise Majority and √n Grid quorums.
+    pub fn with_seed_policy(n: usize, seed: u64, policy: crate::QuorumPolicy) -> Self {
         assert!(n > 0, "sim cluster must contain at least one node");
         let members: Vec<NodeId> = (0..n as NodeId).collect();
         let nodes = (0..n as NodeId)
-            .map(|id| Node::new(id, members.clone()))
+            .map(|id| Node::with_policy(id, members.clone(), policy))
             .collect();
         Sim {
             nodes,

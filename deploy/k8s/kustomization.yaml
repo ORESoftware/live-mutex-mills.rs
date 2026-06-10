@@ -1,0 +1,15 @@
+# Declarative bring-up of the leaderless lmxd cluster.
+#   kubectl apply -k deploy/k8s
+# The verify Job is intentionally NOT included here — it is a one-shot
+# correctness gate applied separately (deploy/k8s/verify-job.yaml) once the
+# StatefulSet is Ready.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: live-mutex-mills
+resources:
+  - namespace.yaml
+  - service-peers.yaml
+  - service-client.yaml
+  - statefulset.yaml
+commonLabels:
+  app.kubernetes.io/part-of: live-mutex-mills
