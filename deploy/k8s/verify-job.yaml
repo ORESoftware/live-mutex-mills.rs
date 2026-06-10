@@ -112,10 +112,21 @@ spec:
         role: verify
     spec:
       restartPolicy: Never
+      # Hardening: the gate only needs the network, not the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: verify
-          image: curlimages/curl:latest
+          image: curlimages/curl:8.11.1   # pinned (not :latest); image runs as uid 100
           command: ["sh", "/scripts/verify.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: WORKERS
               value: "12"
