@@ -56,6 +56,10 @@ spec:
             # Quorum policy: "majority" (floor(n/2)+1, O(n) msgs) or "grid"
             # (√n Maekawa row∪column, O(√n) msgs). For a meaningful grid set
             # replicas to a square (e.g. 9 → 3×3) and bump LMX_REPLICAS to match.
+            # SAFETY: this must be uniform across the cluster. Do NOT change it via
+            # a rolling update (which transiently mixes grid + majority nodes,
+            # whose quorums need not intersect). To switch, drain locks and restart
+            # all pods at once (e.g. scale to 0, change value, scale back up).
             - name: LMX_QUORUM_POLICY
               value: "majority"
           readinessProbe:

@@ -182,6 +182,11 @@ struct RequesterState {
 /// requesters' fully-granted vote sets must intersect, so a single arbiter would
 /// have to grant its one vote twice — impossible. Only the *shape* of the quorum
 /// differs. See `docs/sqrt-n-quorum-design.md`.
+///
+/// SAFETY: the policy MUST be identical on every node in a cluster. A `Grid`
+/// quorum and a `Majority` quorum are NOT guaranteed to intersect, so a mixed
+/// cluster can grant the same lock to two holders. Never switch policy with a
+/// rolling update; drain and restart the whole cluster instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuorumPolicy {
     /// v1 behavior: ask every member, acquire on a strict majority

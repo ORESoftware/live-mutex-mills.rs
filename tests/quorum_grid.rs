@@ -144,6 +144,54 @@ fn grid_single_lock_all_nodes_contend_many_seeds() {
     }
 }
 
+fn grid_step_until_acquired(sim: &mut Sim, node: NodeId, lock: &str) -> Fence {
+    for _ in 0..100_000 {
+        for (n, l, fence) in sim.drain_acquired() {
+            if n == node && l == lock {
+                return fence;
+            }
+        }
+        if !sim.step() {
+            break;
+        }
+    }
+    panic!("node {node} never acquired {lock} (grid)");
+}
+
+#[test]
+fn grid_survivor_takes_over_after_holder_crash() {
+    // Holder-failure recovery under GRID quorums (failover.rs only covers
+    // majority). n=4 → 2×2 grid: Q_0 = {0,1,2}, Q_3 = {1,2,3}. Q_3 excludes
+    // node 0, so after the holder (node 0) crashes and its vote leases lapse at
+    // arbiters 1 and 2, node 3 can assemble its full quorum and take over — with
+    // a strictly greater fence token, fencing the dead holder out downstream.
+    use live_mutex_mills::LEASE;
+    let mut sim = Sim::with_seed_policy(4, 7, QuorumPolicy::Grid);
+
+    sim.request(0, "A");
+    let token0 = grid_step_until_acquired(&mut sim, 0, "A");
+
+    sim.request(3, "A");
+    for _ in 0..1000 {
+        if !sim.step() {
+            break;
+        }
+    }
+    assert!(
+        sim.drain_acquired().is_empty(),
+        "node 3 must not acquire while node 0 holds (grid)",
+    );
+
+    sim.crash(0);
+    sim.advance(LEASE * 2);
+
+    let token3 = grid_step_until_acquired(&mut sim, 3, "A");
+    assert!(
+        token3 > token0,
+        "fence must increase across grid failover: dead holder {token0}, survivor {token3}",
+    );
+}
+
 #[test]
 fn grid_ignores_grants_from_outside_quorum() {
     // Hardening: the acquire condition is `votes >= threshold`. If a grid node
