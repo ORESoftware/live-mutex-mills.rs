@@ -44,3 +44,43 @@ fn fence_saturates_instead_of_wrapping() {
         "fence must saturate at u64::MAX, never wrap below the previous token",
     );
 }
+
+#[test]
+fn idle_prune_preserves_fence_bearing_arbiters() {
+    // The tick() memory-prune must drop only fully-idle entries that NEVER
+    // recorded a fence. An idle entry with fence_max > 0 must survive — pruning
+    // it would reset the fence and let a token be reused.
+    let mut node = Node::new(0, vec![0 as NodeId]);
+
+    // Record fence_max = 5 at the arbiter for "L".
+    node.handle(
+        0,
+        0,
+        Message::Confirm {
+            lock: "L".to_string(),
+            req: RequestId { ts: 1, node: 0 },
+            fence: 5,
+        },
+    );
+    let _ = node.drain_outbox();
+
+    // Tick across a long idle period — the prune runs every tick.
+    for t in 1..6u64 {
+        node.tick(t * 10_000);
+        let _ = node.drain_outbox();
+    }
+
+    // Acquire "L": the (preserved) fence_max=5 must yield token 6, not a reset-to-1.
+    node.request(0, "L");
+    for _ in 0..8 {
+        for out in node.drain_outbox() {
+            node.handle(0, out.to, out.msg);
+        }
+    }
+    let acq = node.take_acquired();
+    assert_eq!(acq.len(), 1);
+    assert_eq!(
+        acq[0].1, 6,
+        "idle arbiter with fence_max=5 must be preserved (token 6), not pruned and reset to 1",
+    );
+}

@@ -475,6 +475,14 @@ impl Node {
                 }
             }
         }
+
+        // Bound memory: drop arbiter entries that are fully idle AND never
+        // recorded a fence (created only by a spurious Request/Confirm{fence:0}
+        // for a lock name that was never really held). We must NOT prune entries
+        // with fence_max > 0 — that would reset the fence for a previously-used
+        // lock and let a token be reused, defeating the downstream backstop.
+        self.arbiter
+            .retain(|_, a| !(a.voted_for.is_none() && a.queue.is_empty() && a.fence_max == 0));
     }
 
     /// Take everything the node wants to send since the last drain.
