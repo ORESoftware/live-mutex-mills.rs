@@ -249,6 +249,11 @@ pub struct Node {
     /// Grants needed to enter the critical section. Majority → `floor(n/2)+1`;
     /// Grid → `targets.len()` (every node in the quorum set must grant).
     threshold: usize,
+    /// `targets` as a set, for O(1) membership checks on the grant/revoke hot
+    /// path. Safety guard: votes are only ever counted from nodes in this set,
+    /// so `votes.len() >= threshold` can never be satisfied by a grant from
+    /// OUTSIDE the quorum (which would break the quorum-intersection invariant).
+    target_set: HashSet<NodeId>,
     policy: QuorumPolicy,
     lamport: Lamport,
     arbiter: HashMap<LockId, ArbiterState>,
@@ -287,11 +292,13 @@ impl Node {
                 (q, t)
             }
         };
+        let target_set: HashSet<NodeId> = targets.iter().copied().collect();
         Node {
             id,
             members,
             targets,
             threshold,
+            target_set,
             policy,
             lamport: 0,
             arbiter: HashMap::new(),
@@ -657,6 +664,13 @@ impl Node {
     // ---- requester role --------------------------------------------------
 
     fn on_grant(&mut self, from: NodeId, lock: LockId, req: RequestId, fence: Fence) {
+        // Safety guard: only count votes from arbiters in our quorum set. A grant
+        // from outside the quorum (spurious, misrouted, duplicated) must never
+        // contribute to reaching `threshold`, or two non-intersecting vote sets
+        // could each reach it and both acquire.
+        if !self.target_set.contains(&from) {
+            return;
+        }
         let quorum = self.threshold;
         let mut confirm: Vec<NodeId> = Vec::new();
         let mut token: Fence = 0;
@@ -747,6 +761,10 @@ impl Node {
     /// Requester: an arbiter reclaimed our vote. Drop it; if that drops us below
     /// quorum while we believed we held the lock, we have lost it.
     fn on_revoked(&mut self, from: NodeId, lock: LockId, req: RequestId) {
+        // Mirror the on_grant guard: only quorum members ever held our votes.
+        if !self.target_set.contains(&from) {
+            return;
+        }
         let quorum = self.threshold;
         let mut lost = false;
         if let Some(r) = self.requester.get_mut(&lock) {

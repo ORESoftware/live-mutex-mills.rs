@@ -172,6 +172,40 @@ brain re-forms intersecting quorums around the live set, rather than pretending
 intersection isn't needed. Designing `QuorumPolicy` now makes that a drop-in
 later.
 
+## 6b. Operational safety constraints (MUST read before enabling grid)
+
+These are hard constraints — violating them can break mutual exclusion. The
+implementation enforces what it can locally; the rest are deployment rules.
+
+1. **The policy MUST be uniform across the whole cluster.** A grid quorum
+   (≈2√n−1 nodes) and a majority quorum (>n/2 nodes) are **not guaranteed to
+   intersect** — for large n, |Q_grid| + |Q_majority| < n+1, so two holders
+   (one acquired via grid, one via majority) could both hold. Therefore you may
+   **not** run some nodes on `majority` and others on `grid`, and you may **not**
+   switch policy via a rolling update (which transiently mixes them). Changing
+   policy requires draining all locks and restarting the whole cluster on the new
+   policy. (The k8s `LMX_QUORUM_POLICY` env is set cluster-wide on the
+   StatefulSet, so steady state is uniform; the hazard is only during a
+   policy-changing rollout.)
+
+2. **All nodes MUST build the grid from the same member list in the same order.**
+   `grid_quorum` maps members→cells by their index in the ordered member list; if
+   two nodes disagree on the order, their grids can fail to intersect. The daemon
+   guarantees this (membership is the positional peer-address list, identical on
+   every node). Don't hand different orders to different nodes.
+
+3. **Membership is fixed.** Grid quorums assume a fixed member set (same as the
+   majority path today). Dynamic membership needs one-at-a-time reconfiguration
+   so old and new quorum systems always overlap — see §6 (the raft brain is the
+   intended owner of safe reconfiguration).
+
+**Defensive guard (implemented):** a requester only counts grants from arbiters
+in its own quorum set (`target_set`/`targetSet`), so a spurious, duplicated, or
+misrouted `Grant` from outside the quorum can never push `votes` to `threshold`.
+This keeps "votes ⊇ my quorum" the *only* way to acquire, which is what the
+intersection proof relies on. Tested by `grid_ignores_grants_from_outside_quorum`
+in both engines.
+
 ## 7. Test plan
 
 - **Property test (safety):** extend `tests/mutual_exclusion.rs` /

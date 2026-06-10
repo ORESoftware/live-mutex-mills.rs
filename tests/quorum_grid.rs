@@ -8,10 +8,10 @@
 //!      (the same workload shape as `mutual_exclusion.rs`) driven under
 //!      `QuorumPolicy::Grid`, so the smaller quorums are exercised end to end.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use live_mutex_mills::sim::Sim;
-use live_mutex_mills::{grid_quorum, Fence, NodeId, QuorumPolicy};
+use live_mutex_mills::{grid_quorum, Fence, Message, Node, NodeId, QuorumPolicy};
 
 // ---- 1. intersection: the safety-critical structural property --------------
 
@@ -142,6 +142,50 @@ fn grid_single_lock_all_nodes_contend_many_seeds() {
             run_grid(n, seed.wrapping_mul(0x9E37_79B9) ^ (n as u64), &reqs);
         }
     }
+}
+
+#[test]
+fn grid_ignores_grants_from_outside_quorum() {
+    // Hardening: the acquire condition is `votes >= threshold`. If a grid node
+    // ever counted a grant from a node OUTSIDE its quorum set, threshold could be
+    // reached without true quorum coverage — and two non-intersecting vote sets
+    // could both acquire. The defensive guard must drop such grants. n=16 so the
+    // non-quorum set (9 nodes) is larger than the threshold (7).
+    let n = 16usize;
+    let members: Vec<NodeId> = (0..n as NodeId).collect();
+    let mut node = Node::with_policy(0, members.clone(), QuorumPolicy::Grid);
+    let q: HashSet<NodeId> = grid_quorum(0, &members).into_iter().collect();
+    let threshold = node.quorum_size();
+    assert_eq!(threshold, q.len());
+
+    node.request(0, "L");
+    // Recover our own RequestId from the Request messages we just emitted.
+    let req = node
+        .drain_outbox()
+        .into_iter()
+        .find_map(|o| match o.msg {
+            Message::Request { req, .. } => Some(req),
+            _ => None,
+        })
+        .expect("request() must emit a Request");
+
+    let non_q: Vec<NodeId> = members.iter().copied().filter(|m| !q.contains(m)).collect();
+    assert!(non_q.len() >= threshold, "test precondition: |non-quorum| >= threshold");
+
+    // Feed `threshold` grants from NON-quorum nodes — must NOT acquire.
+    for &m in non_q.iter().take(threshold) {
+        node.handle(0, m, Message::Grant { lock: "L".to_string(), req, fence: 0 });
+    }
+    assert!(
+        node.take_acquired().is_empty(),
+        "SAFETY: acquired the lock from out-of-quorum grants — the guard failed",
+    );
+
+    // Now feed the real quorum's grants — should acquire exactly once.
+    for &m in &q {
+        node.handle(0, m, Message::Grant { lock: "L".to_string(), req, fence: 0 });
+    }
+    assert_eq!(node.take_acquired().len(), 1, "must acquire once the full quorum grants");
 }
 
 #[test]
