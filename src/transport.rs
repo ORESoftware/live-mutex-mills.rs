@@ -181,8 +181,10 @@ pub fn run_node_with_settings(
                     let mut sink = String::new();
                     loop {
                         sink.clear();
-                        match r.read_line(&mut sink) {
-                            Ok(0) | Err(_) => break, // peer closed; reconnect
+                        // Bounded: this socket only signals peer-close; a peer
+                        // dribbling bytes with no newline must not OOM the dialer.
+                        match read_line_bounded(&mut r, &mut sink, DEFAULT_MAX_LINE_FRAME) {
+                            Ok(0) | Err(_) => break, // peer closed/garbage; reconnect
                             Ok(_) => {}
                         }
                     }
@@ -313,13 +315,26 @@ fn write_to(writers: &mut HashMap<NodeId, TcpStream>, to: NodeId, codec: WireCod
 }
 
 /// Read a connection: first `HELLO <id> [codec]`, then one message per line.
+/// Read one line, bounded so a peer that never sends a newline cannot exhaust
+/// memory. Previously `read_line` buffered the whole line and the cap was only
+/// checked AFTER — a peer dribbling bytes forever would OOM the node. Mirrors
+/// `client_api::read_line_limited` (the client surface already did this right).
+fn read_line_bounded<R: BufRead>(r: &mut R, buf: &mut String, max: usize) -> io::Result<usize> {
+    let start = buf.len();
+    let n = r.by_ref().take(max as u64 + 1).read_line(buf)?;
+    if buf.len() - start > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer line exceeds max_line_frame",
+        ));
+    }
+    Ok(n)
+}
+
 fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>, max_line_frame: usize) {
     let mut r = BufReader::new(stream);
     let mut line = String::new();
-    if r.read_line(&mut line).is_err() {
-        return;
-    }
-    if line.len() > max_line_frame {
+    if read_line_bounded(&mut r, &mut line, max_line_frame).is_err() {
         return;
     }
     let mut hello = line.split_whitespace();
@@ -342,12 +357,9 @@ fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>, max_line_frame: usize) {
     }
     loop {
         line.clear();
-        match r.read_line(&mut line) {
+        match read_line_bounded(&mut r, &mut line, max_line_frame) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
-                if line.len() > max_line_frame {
-                    return;
-                }
                 if let Some(msg) = codec.decode_line(line.trim()) {
                     if ev_tx.send(Ev::In(peer, msg)).is_err() {
                         return;

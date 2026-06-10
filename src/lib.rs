@@ -706,7 +706,13 @@ impl Node {
                 if r.votes.len() >= quorum {
                     // Quorum reached — enter the critical section.
                     r.locked = true;
-                    let chosen = r.best_fence + 1;
+                    // saturating_add: never panic (debug) or wrap to 0 (release).
+                    // A wrap would make the new token SMALLER than the previous
+                    // holder's, breaking the fence monotonicity the token exists to
+                    // provide. (Members are trusted; this guards the realistic
+                    // accidental-overflow case, not a malicious peer forging a
+                    // near-u64::MAX fence on the wire.)
+                    let chosen = r.best_fence.saturating_add(1);
                     r.best_fence = chosen;
                     token = chosen;
                     newly_acquired = Some(chosen);
