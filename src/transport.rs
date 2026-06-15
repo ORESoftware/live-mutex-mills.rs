@@ -6,7 +6,8 @@
 //! the one the *sender* dialed — which gives the FIFO-per-link ordering the
 //! protocol requires (see crate docs). A node therefore:
 //!
-//! - **dials** every peer and uses those outbound connections for *writing*;
+//! - **dials** every peer it may send protocol messages to and uses those
+//!   outbound connections for *writing*;
 //! - **accepts** connections and uses them for *reading*.
 //!
 //! Everything funnels through one event loop on a single driver thread that
@@ -149,8 +150,19 @@ pub fn run_node_with_settings(
         });
     }
 
-    // Dial every peer (retrying) and hand the writable stream to the loop.
-    for peer in (0..n as NodeId).filter(|&p| p != id) {
+    let dial_peers = dial_peers_for(&node);
+    let dial_set: HashSet<NodeId> = dial_peers.iter().copied().collect();
+    let _ = evt_tx.send(NodeEvent::Info(format!(
+        "dialing {} outbound peer links for quorum {:?}",
+        dial_peers.len(),
+        settings.quorum_policy
+    )));
+
+    // Dial every peer this quorum policy can send to (retrying) and hand the
+    // writable stream to the loop. Majority keeps the old all-to-all mesh; Grid
+    // only dials row/column quorum neighbors. Grid quorums are symmetric, so an
+    // arbiter's replies to a requester use the same sparse link set.
+    for peer in dial_peers {
         let addr = addrs[peer as usize].clone();
         let ev_tx = ev_tx.clone();
         let retry = settings.connect_retry;
@@ -247,6 +259,11 @@ pub fn run_node_with_settings(
                 let _ = ev_tx.send(Ev::In(id, out.msg));
             } else if writers.contains_key(&out.to) {
                 write_to(&mut writers, out.to, settings.codec, &out.msg);
+            } else if !dial_set.contains(&out.to) {
+                let _ = evt_tx.send(NodeEvent::Info(format!(
+                    "dropping message to node {} outside {:?} transport links",
+                    out.to, settings.quorum_policy
+                )));
             } else {
                 pending.entry(out.to).or_default().push(out.msg);
             }
@@ -260,6 +277,14 @@ pub fn run_node_with_settings(
     }
 
     Ok(())
+}
+
+fn dial_peers_for(node: &Node) -> Vec<NodeId> {
+    node.quorum_members()
+        .iter()
+        .copied()
+        .filter(|&peer| peer != node.id)
+        .collect()
 }
 
 fn validate_settings(settings: TransportSettings) -> io::Result<()> {
@@ -367,5 +392,32 @@ fn read_conn(stream: TcpStream, ev_tx: Sender<Ev>, max_line_frame: usize) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Node, NodeId, QuorumPolicy};
+
+    use super::dial_peers_for;
+
+    #[test]
+    fn majority_transport_still_dials_every_other_peer() {
+        let members: Vec<NodeId> = (0..5).collect();
+        let node = Node::with_policy(2, members, QuorumPolicy::Majority);
+
+        assert_eq!(dial_peers_for(&node), vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn grid_transport_dials_only_quorum_neighbors() {
+        let members: Vec<NodeId> = (0..21).collect();
+        let node = Node::with_policy(1, members, QuorumPolicy::Grid);
+
+        // Node 1 is in row 0, column 1 of a 5x5 partially-filled grid.
+        // Its quorum is row 0 plus column 1, so it needs seven outbound links
+        // instead of the twenty links required by an all-to-all 21-node mesh.
+        assert_eq!(node.quorum_size(), 8);
+        assert_eq!(dial_peers_for(&node), vec![0, 2, 3, 4, 6, 11, 16]);
     }
 }
