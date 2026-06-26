@@ -6,7 +6,9 @@
 > `remote/submodules/live-mutex-mills.rs` — make changes here, not in that submodule checkout.
 >
 > On disk: source clone `~/codes/ores/live-mutex-mills.rs` · submodule checkout `~/codes/ores/k8s-cluster/remote/submodules/live-mutex-mills.rs`.
-<!-- END k8s-cluster-submodule-notice --># live-mutex-mills
+<!-- END k8s-cluster-submodule-notice -->
+
+# live-mutex-mills
 
 A **leaderless, quorum/vote distributed mutual-exclusion** protocol — an
 alternative to Raft/Paxos specialized for *locking* rather than general
