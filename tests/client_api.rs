@@ -342,6 +342,14 @@ impl TcpTextClient {
 }
 
 fn http_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> Value {
+    let (status, value) = http_status_json(addr, method, path, body);
+    assert_eq!(status, 200, "expected 200 from {method} {path}, got {status}: {value}");
+    value
+}
+
+/// Like `http_json` but returns the status line code alongside the parsed body instead of
+/// asserting 200 — for exercising error responses (e.g. a rejected semaphore limit).
+fn http_status_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> (u16, Value) {
     let body = body.to_string();
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -364,8 +372,13 @@ fn http_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> Value {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
-    serde_json::from_str(body).unwrap()
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in response: {response}"));
+    (status, serde_json::from_str(body).unwrap())
 }
 
 fn field<'a>(line: &'a str, prefix: &str) -> &'a str {
