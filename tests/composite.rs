@@ -178,7 +178,7 @@ fn canonical_keys_dedups_and_sorts() {
 fn canonical_keys_rejects_empty_set_and_empty_keys() {
     use live_mutex_mills::composite::{canonical_keys, CompositeError};
     assert!(matches!(canonical_keys(&[]), Err(CompositeError::Empty)));
-    let with_blank: Vec<String> = ["ok".to_string(), String::new()];
+    let with_blank: Vec<String> = vec!["ok".to_string(), String::new()];
     assert!(matches!(
         canonical_keys(&with_blank),
         Err(CompositeError::EmptyKey)
