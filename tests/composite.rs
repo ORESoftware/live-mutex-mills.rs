@@ -160,3 +160,49 @@ fn cap_is_three() {
     assert!(Composite::new(&four).is_err());
     assert_eq!(MAX_COMPOSITE_KEYS, 3);
 }
+
+#[test]
+fn canonical_keys_dedups_and_sorts() {
+    use live_mutex_mills::composite::canonical_keys;
+    let keys: Vec<String> = ["b", "a", "b", "c", "a"].iter().map(|s| s.to_string()).collect();
+    let canon = canonical_keys(&keys).expect("valid after dedup");
+    assert_eq!(canon, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    // A composite built from the same multiset acquires in that canonical order — the
+    // single global key order that makes overlapping composites deadlock-free.
+    let c = Composite::new(&keys).expect("valid composite");
+    assert_eq!(c.keys(), canon.as_slice());
+    assert_eq!(c.pending().map(String::as_str), Some("a"));
+}
+
+#[test]
+fn canonical_keys_rejects_empty_set_and_empty_keys() {
+    use live_mutex_mills::composite::{canonical_keys, CompositeError};
+    assert!(matches!(canonical_keys(&[]), Err(CompositeError::Empty)));
+    let with_blank: Vec<String> = vec!["ok".to_string(), String::new()];
+    assert!(matches!(
+        canonical_keys(&with_blank),
+        Err(CompositeError::EmptyKey)
+    ));
+}
+
+#[test]
+fn duplicate_keys_do_not_count_toward_the_three_key_cap() {
+    use live_mutex_mills::composite::canonical_keys;
+    // Four entries but only three DISTINCT keys after de-dup -> accepted.
+    let dupes: Vec<String> = ["a", "b", "a", "c"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(canonical_keys(&dupes).unwrap().len(), 3);
+    // Four distinct keys -> rejected as too many.
+    let four: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+    assert!(canonical_keys(&four).is_err());
+}
+
+#[test]
+fn composite_of_one_key_behaves_as_a_plain_exclusive_lock() {
+    // A single-key "composite" is just a lock: many nodes contending the same one key
+    // must stay mutually exclusive and the per-key fence must strictly increase. This
+    // proves the composite layer degenerates cleanly to the single-key engine.
+    let spec: &[(NodeId, &[&str])] = &[(0, &["solo"]), (1, &["solo"]), (2, &["solo"]), (3, &["solo"])];
+    for seed in 1..120u64 {
+        run(5, seed, spec);
+    }
+}

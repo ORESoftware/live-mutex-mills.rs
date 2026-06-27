@@ -117,6 +117,83 @@ fn external_tcp_and_http_clients_can_use_bounded_semaphores() {
 }
 
 #[test]
+fn capacity_three_semaphore_admits_three_distinct_permits_blocks_the_fourth_and_recycles() {
+    let cluster = TestCluster::start(3);
+    let fe: Vec<SocketAddr> = (0..3)
+        .map(|i| serve_http("127.0.0.1:0", cluster.clients[i].clone()).unwrap())
+        .collect();
+    let acquire = |addr: SocketAddr| {
+        http_json(addr, "POST", "/semaphores/cap3/acquire", json!({"limit": 3}))
+    };
+
+    // Three concurrent holders fit, each on its own permit slot in 0..3.
+    let h1 = acquire(fe[0]);
+    let h2 = acquire(fe[1]);
+    let h3 = acquire(fe[2]);
+    for h in [&h1, &h2, &h3] {
+        assert_eq!(h["ok"], true);
+        assert_eq!(h["limit"], 3);
+    }
+    let permits: std::collections::HashSet<u64> =
+        [&h1, &h2, &h3].iter().map(|h| h["permit"].as_u64().unwrap()).collect();
+    assert_eq!(permits.len(), 3, "three holders must occupy three distinct permits: {permits:?}");
+    assert!(permits.iter().all(|&p| p < 3), "permits must be in 0..3: {permits:?}");
+
+    // The fourth request blocks while the semaphore is full.
+    let fourth_addr = fe[0];
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        tx.send(acquire(fourth_addr)).unwrap();
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        rx.try_recv().is_err(),
+        "fourth client acquired a capacity-3 semaphore while three holders were active"
+    );
+
+    // Free one permit; the fourth proceeds and recycles exactly the freed slot.
+    http_json(fe[0], "POST", "/semaphores/release", json!({"holder": h1["holder"].as_str().unwrap()}));
+    let h4 = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("fourth client should acquire after a permit is released");
+    assert_eq!(h4["ok"], true);
+    assert_eq!(h4["semaphore"], "cap3");
+    assert_eq!(
+        h4["permit"].as_u64().unwrap(),
+        h1["permit"].as_u64().unwrap(),
+        "the only free slot was the released one, so it must be reused"
+    );
+
+    for (addr, h) in [(fe[1], &h2), (fe[2], &h3), (fe[0], &h4)] {
+        http_json(addr, "POST", "/semaphores/release", json!({"holder": h["holder"].as_str().unwrap()}));
+    }
+    cluster.shutdown();
+}
+
+#[test]
+fn semaphore_rejects_out_of_range_limits() {
+    let cluster = TestCluster::start(3);
+    let fe = serve_http("127.0.0.1:0", cluster.clients[0].clone()).unwrap();
+
+    // Below the minimum (2) and above the maximum (100) are both rejected with 400.
+    for bad in [1u64, 101] {
+        let (status, body) =
+            http_status_json(fe, "POST", "/semaphores/bounded/acquire", json!({"limit": bad}));
+        assert_eq!(status, 400, "limit {bad} should be rejected: {body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "bad_limit", "limit {bad}: {body}");
+    }
+
+    // A limit at the minimum still works, proving the bound is inclusive.
+    let ok = http_json(fe, "POST", "/semaphores/bounded/acquire", json!({"limit": 2}));
+    assert_eq!(ok["ok"], true);
+    assert_eq!(ok["limit"], 2);
+    http_json(fe, "POST", "/semaphores/release", json!({"holder": ok["holder"].as_str().unwrap()}));
+
+    cluster.shutdown();
+}
+
+#[test]
 fn external_clients_can_use_rw_locks() {
     let cluster = TestCluster::start(3);
     let http_a = serve_http("127.0.0.1:0", cluster.clients[0].clone()).unwrap();
@@ -342,6 +419,14 @@ impl TcpTextClient {
 }
 
 fn http_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> Value {
+    let (status, value) = http_status_json(addr, method, path, body);
+    assert_eq!(status, 200, "expected 200 from {method} {path}, got {status}: {value}");
+    value
+}
+
+/// Like `http_json` but returns the status line code alongside the parsed body instead of
+/// asserting 200 — for exercising error responses (e.g. a rejected semaphore limit).
+fn http_status_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> (u16, Value) {
     let body = body.to_string();
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -364,8 +449,13 @@ fn http_json(addr: SocketAddr, method: &str, path: &str, body: Value) -> Value {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
-    serde_json::from_str(body).unwrap()
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in response: {response}"));
+    (status, serde_json::from_str(body).unwrap())
 }
 
 fn field<'a>(line: &'a str, prefix: &str) -> &'a str {
