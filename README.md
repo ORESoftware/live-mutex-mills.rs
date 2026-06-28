@@ -1,3 +1,13 @@
+<!-- BEGIN k8s-cluster-submodule-notice -->
+> [!NOTE]
+> **Canonical source.** This repository is the source of truth for its code. It
+> is also vendored as a **secondary** git submodule of
+> [ORESoftware/k8s-cluster](https://github.com/ORESoftware/k8s-cluster) at
+> `remote/submodules/live-mutex-mills.rs` — make changes here, not in that submodule checkout.
+>
+> On disk: source clone `~/codes/ores/live-mutex-mills.rs` · submodule checkout `~/codes/ores/k8s-cluster/remote/submodules/live-mutex-mills.rs`.
+<!-- END k8s-cluster-submodule-notice -->
+
 # live-mutex-mills
 
 A **leaderless, quorum/vote distributed mutual-exclusion** protocol — an
