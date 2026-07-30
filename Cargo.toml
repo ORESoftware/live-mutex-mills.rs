@@ -12,6 +12,8 @@ rmp-serde = "1.3"
 # OS CSPRNG for unguessable client holder tokens (a sequential counter let any
 # client release another client's lock on the same node by guessing the id).
 getrandom = "0.2"
+tracing = "0.1"
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
 
 [build-dependencies]
 cc = "1"

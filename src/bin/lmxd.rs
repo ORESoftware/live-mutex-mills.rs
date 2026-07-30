@@ -26,6 +26,10 @@ use live_mutex_mills::composite::{Composite, Progress};
 use live_mutex_mills::transport::{run_node_with_settings, Command, NodeEvent};
 
 fn main() {
+    // Retain the guard for the life of the daemon so the OTLP batch processor
+    // flushes spans and structured events during controlled shutdown.
+    let _telemetry = fiducia_telemetry::init("live-mutex-mills");
+
     let config = match BrokerRuntimeConfig::from_process() {
         Ok(config) => config,
         Err(BrokerRuntimeConfigError::HelpRequested(help)) => {
@@ -33,7 +37,7 @@ fn main() {
             return;
         }
         Err(err) => {
-            eprintln!("{err}");
+            tracing::error!(error = %err, "invalid broker configuration");
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
@@ -54,18 +58,18 @@ fn main() {
 
     if let Some(addr) = client_http {
         match serve_http(&addr, client.clone()) {
-            Ok(bound) => println!("# client HTTP listening on {bound}"),
+            Ok(bound) => tracing::info!(%bound, "client HTTP listening"),
             Err(e) => {
-                eprintln!("client HTTP bind error on {addr}: {e}");
+                tracing::error!(%addr, error = %e, "client HTTP bind failed");
                 std::process::exit(1);
             }
         }
     }
     if let Some(addr) = client_tcp {
         match serve_tcp(&addr, client.clone()) {
-            Ok(bound) => println!("# client TCP listening on {bound}"),
+            Ok(bound) => tracing::info!(%bound, "client TCP listening"),
             Err(e) => {
-                eprintln!("client TCP bind error on {addr}: {e}");
+                tracing::error!(%addr, error = %e, "client TCP bind failed");
                 std::process::exit(1);
             }
         }
@@ -85,10 +89,14 @@ fn main() {
         for ev in evt_rx {
             match ev {
                 NodeEvent::Acquired(lock, fence) => {
+                    tracing::info!(%lock, %fence, event = "acquired", "lock acquired");
                     println!("ACQUIRED {lock} fence={fence}");
                     let _ = demo_tx.send((lock, fence));
                 }
-                NodeEvent::Lost(lock) => println!("LOST {lock}"),
+                NodeEvent::Lost(lock) => {
+                    tracing::warn!(%lock, event = "lost", "lock lost");
+                    println!("LOST {lock}");
+                }
                 NodeEvent::Info(s) => {
                     if log_info {
                         println!("# {s}");
@@ -106,7 +114,7 @@ fn main() {
             let mut c = match Composite::new(&keys) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("invalid LMX_DEMO_KEYS: {e}");
+                    tracing::error!(error = %e, "invalid LMX_DEMO_KEYS");
                     return;
                 }
             };
@@ -212,8 +220,15 @@ fn main() {
         codec.as_str(),
         transport.quorum_policy
     );
+    tracing::info!(
+        node_id = id,
+        cluster_nodes = addrs.len(),
+        codec = codec.as_str(),
+        quorum = ?transport.quorum_policy,
+        "live-mutex-mills node starting"
+    );
     if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
-        eprintln!("node error: {e}");
+        tracing::error!(error = %e, "node failed");
         std::process::exit(1);
     }
 }
