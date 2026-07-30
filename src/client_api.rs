@@ -38,7 +38,11 @@ static ACTIVE_CLIENT_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Read one line, erroring if it exceeds `max` bytes so an unbounded line
 /// cannot exhaust memory. Returns the number of bytes read (0 = EOF).
-fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max: usize) -> io::Result<usize> {
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max: usize,
+) -> io::Result<usize> {
     let start = buf.len();
     let n = reader.by_ref().take(max as u64 + 1).read_line(buf)?;
     if buf.len() - start > max {
@@ -637,8 +641,7 @@ impl LockClient {
     }
 
     fn register_rw_bundle(&self, bundle: RwBundle) -> String {
-        let holder =
-            random_holder_token("rw", self.next_rw_holder.fetch_add(1, Ordering::Relaxed));
+        let holder = random_holder_token("rw", self.next_rw_holder.fetch_add(1, Ordering::Relaxed));
         self.rw_holders
             .lock()
             .expect("rw holder map poisoned")
@@ -1008,6 +1011,7 @@ pub fn serve_tcp(addr: &str, client: LockClient) -> io::Result<SocketAddr> {
     Ok(local_addr)
 }
 
+#[tracing::instrument(name = "live_mutex_mills.tcp_client", skip_all)]
 fn handle_tcp_client(mut stream: TcpStream, client: LockClient) -> io::Result<()> {
     writeln!(
         stream,
@@ -1269,6 +1273,7 @@ pub fn serve_http(addr: &str, client: LockClient) -> io::Result<SocketAddr> {
     Ok(local_addr)
 }
 
+#[tracing::instrument(name = "live_mutex_mills.http_client", skip_all)]
 fn handle_http_client(mut stream: TcpStream, client: LockClient) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();

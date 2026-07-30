@@ -71,6 +71,15 @@ spec:
               value: "6971"
             - name: LMX_LOG_INFO
               value: "on"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://dd-otel-collector.observability.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: >-
+                service.namespace=oresoftware,
+                deployment.environment.name=remote-dev,
+                github.repository=ORESoftware/live-mutex-mills.rs
             # Quorum policy: "majority" (floor(n/2)+1, O(n) msgs) or "grid"
             # (√n Maekawa row∪column, O(√n) msgs). For a meaningful grid set
             # replicas to a square (e.g. 9 → 3×3) and bump LMX_REPLICAS to match.
