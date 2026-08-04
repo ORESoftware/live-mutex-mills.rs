@@ -1,17 +1,23 @@
 //! Typed runtime configuration for the `lmxd` broker.
 //!
-//! CLI flags are parsed through the project-local `.cli-flags.toml` with the
-//! vendored `flags-2-env` parser. Reconciliation is intentionally explicit:
+//! CLI flags are parsed through the reviewed `.cli-flags.toml` contract with
+//! the vendored `flags-2-env` parser. Reconciliation is intentionally explicit:
 //! named CLI flags win over legacy positional CLI values, which win over env
 //! vars, which finally fall back to typed defaults.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::codec::WireCodec;
 use crate::composite::Composite;
@@ -43,6 +49,7 @@ const ENV_FLAGS2ENV_CONFIG: &str = "FLAGS2ENV_CONFIG";
 const ENV_LMX_CLI_FLAGS_CONFIG: &str = "LMX_CLI_FLAGS_CONFIG";
 const DEFAULT_DEMO_KEYS: &str = "cap,mid,zed";
 const CLI_FLAGS_FILE: &str = ".cli-flags.toml";
+const PACKAGE_SHARE_DIR: &str = "live-mutex-mills";
 const EMBEDDED_CLI_FLAGS_TOML: &str = include_str!("../.cli-flags.toml");
 const DEFAULT_CONNECT_RETRY_MS: u64 = 150;
 const DEFAULT_TICK_MS: u64 = 500;
@@ -58,6 +65,9 @@ const MIN_MAX_FRAME_BYTES: usize = 128;
 const MAX_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEMO_DELAY_MS: u64 = 60 * 60 * 1000;
 
+static EMBEDDED_CLI_FLAGS_PATH: OnceLock<PathBuf> = OnceLock::new();
+static EMBEDDED_CLI_FLAGS_NONCE: AtomicU64 = AtomicU64::new(0);
+
 extern "C" {
     fn f2e_parse_json_argv_from_file(
         config_path: *const c_char,
@@ -69,7 +79,6 @@ extern "C" {
         terminal_columns: c_int,
     ) -> *mut c_char;
     fn f2e_audit_config_status_from_file(config_path: *const c_char) -> c_int;
-    fn f2e_audit_config_from_file(config_path: *const c_char) -> *mut c_char;
     fn f2e_free(value: *mut c_char);
 }
 
@@ -203,6 +212,8 @@ impl BrokerRuntimeConfig {
 pub enum BrokerRuntimeConfigError {
     HelpRequested(String),
     CliFlagsConfigNotFound,
+    ExplicitConfigMustBeAbsolute,
+    ExplicitConfigUnreadable,
     CliFlagsConfigInvalid {
         path: PathBuf,
         report: String,
@@ -260,28 +271,31 @@ impl fmt::Display for BrokerRuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HelpRequested(_) => write!(f, "help requested"),
-            Self::CliFlagsConfigNotFound => write!(f, "could not find {CLI_FLAGS_FILE}"),
-            Self::CliFlagsConfigInvalid { path, report } => {
-                write!(f, "{} failed flags2env audit: {report}", path.display())
+            Self::CliFlagsConfigNotFound => write!(f, "reviewed broker CLI contract not found"),
+            Self::ExplicitConfigMustBeAbsolute => {
+                write!(f, "broker CLI contract selector must be an absolute path")
             }
-            Self::CliParserCString(err) => write!(f, "invalid string for flags2env: {err}"),
-            Self::CliParserJson { raw, source } => {
-                write!(f, "flags2env returned invalid JSON ({source}): {raw}")
+            Self::ExplicitConfigUnreadable => {
+                write!(f, "broker CLI contract selector does not name a readable regular file")
             }
+            Self::CliFlagsConfigInvalid { .. } => {
+                write!(f, "reviewed broker CLI contract failed flags2env audit")
+            }
+            Self::CliParserCString(_) => write!(f, "broker CLI parser input is invalid"),
+            Self::CliParserJson { .. } => write!(f, "broker CLI parser returned invalid JSON"),
             Self::CliParseErrors(errors) => {
-                write!(f, "invalid CLI flag values: {}", errors.join("; "))
+                write!(f, "invalid CLI flag value(s) (count: {})", errors.len())
             }
             Self::UnknownCliOptions(options) => {
-                write!(f, "unknown CLI option(s): {}", options.join(", "))
+                write!(f, "unknown CLI option(s) (count: {})", options.len())
             }
-            Self::InvalidJsonList { env, value } => {
-                write!(f, "{env} must be a JSON string array, got {value:?}")
+            Self::InvalidJsonList { env, .. } => {
+                write!(f, "{env} parser metadata is not a JSON string array")
             }
             Self::MissingNodeId => write!(f, "missing broker node id"),
-            Self::InvalidNodeId(raw) => write!(
-                f,
-                "broker node id must be a non-negative integer, got {raw:?}"
-            ),
+            Self::InvalidNodeId(_) => {
+                write!(f, "broker node id must be a non-negative integer")
+            }
             Self::MissingPeerAddrs => write!(f, "missing broker peer address list"),
             Self::NodeIdOutOfRange { id, peers } => {
                 write!(
@@ -289,29 +303,23 @@ impl fmt::Display for BrokerRuntimeConfigError {
                     "broker node id {id} is outside the {peers}-peer address list"
                 )
             }
-            Self::InvalidCodec(raw) => {
-                write!(f, "unknown codec {raw:?}; use text, json, or msgpack")
+            Self::InvalidCodec(_) => write!(f, "unknown codec; use text, json, or msgpack"),
+            Self::InvalidQuorumPolicy(_) => {
+                write!(f, "unknown quorum policy; use majority or grid")
             }
-            Self::InvalidQuorumPolicy(raw) => {
-                write!(f, "unknown quorum policy {raw:?}; use majority or grid")
-            }
-            Self::InvalidBool { env, value } => write!(
+            Self::InvalidBool { env, .. } => write!(
                 f,
-                "{env} must be a boolean value (true/false, 1/0, yes/no, on/off), got {value:?}"
+                "{env} must be a boolean value (true/false, 1/0, yes/no, on/off)"
             ),
             Self::MissingCliValue(flag) => write!(f, "missing value after {flag}"),
-            Self::InvalidPeerAddrs(raw) => {
-                write!(
-                    f,
-                    "{ENV_PEER_ADDRS} must contain at least one address, got {raw:?}"
-                )
+            Self::InvalidPeerAddrs(_) => {
+                write!(f, "{ENV_PEER_ADDRS} must contain at least one valid address")
             }
-            Self::InvalidSocketAddr { env, value } => write!(
-                f,
-                "{env} must look like host:port with a valid TCP port, got {value:?}"
-            ),
-            Self::InvalidNumber { env, value } => {
-                write!(f, "{env} must be a non-negative integer, got {value:?}")
+            Self::InvalidSocketAddr { env, .. } => {
+                write!(f, "{env} must look like host:port with a valid TCP port")
+            }
+            Self::InvalidNumber { env, .. } => {
+                write!(f, "{env} must be a non-negative integer")
             }
             Self::NumberOutOfRange {
                 env,
@@ -319,19 +327,18 @@ impl fmt::Display for BrokerRuntimeConfigError {
                 min,
                 max,
             } => write!(f, "{env} must be between {min} and {max}, got {value}"),
-            Self::InvalidDemoKeys(raw) => {
-                write!(f, "{ENV_DEMO_KEYS} must contain at least one key when demo mode is enabled, got {raw:?}")
+            Self::InvalidDemoKeys(_) => write!(
+                f,
+                "{ENV_DEMO_KEYS} must contain at least one valid key when demo mode is enabled"
+            ),
+            Self::InvalidConfigFlag(_) => write!(
+                f,
+                "invalid broker contract selector syntax; use --config <absolute-path> or --config=<absolute-path>"
+            ),
+            Self::EmbeddedCliFlagsWrite { .. } => {
+                write!(f, "could not materialize the embedded broker CLI contract")
             }
-            Self::InvalidConfigFlag(value) => write!(
-                f,
-                "invalid broker config flag syntax near {value:?}; use --config <path> or --config=<path>"
-            ),
-            Self::EmbeddedCliFlagsWrite { path, source } => write!(
-                f,
-                "could not write embedded broker flags config to {}: {source}",
-                path.display()
-            ),
-            Self::CurrentDir(err) => write!(f, "could not inspect current directory: {err}"),
+            Self::CurrentDir(_) => write!(f, "could not inspect a trusted broker CLI contract"),
         }
     }
 }
@@ -342,39 +349,154 @@ fn resolve_cli_flags_config(
     env: &HashMap<String, String>,
     args: &[String],
 ) -> Result<PathBuf, BrokerRuntimeConfigError> {
-    if let Some(path) = cli_flags_config_from_args(args)?
+    let explicit = cli_flags_config_from_args(args)?
         .or_else(|| non_empty_env(env, ENV_LMX_CLI_FLAGS_CONFIG))
         .or_else(|| non_empty_env(env, ENV_FLAGS2ENV_CONFIG))
+        .map(PathBuf::from);
+    let executable = std::env::current_exe().ok();
+    let source_candidates = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join(CLI_FLAGS_FILE)];
+
+    resolve_cli_flags_config_from(explicit, executable, source_candidates)
+}
+
+fn resolve_cli_flags_config_from(
+    explicit: Option<PathBuf>,
+    executable: Option<PathBuf>,
+    source_candidates: Vec<PathBuf>,
+) -> Result<PathBuf, BrokerRuntimeConfigError> {
+    if let Some(path) = explicit {
+        return validate_explicit_config(path);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(parent) = executable.as_deref().and_then(Path::parent) {
+        candidates.push(
+            parent
+                .join("..")
+                .join("share")
+                .join(PACKAGE_SHARE_DIR)
+                .join(CLI_FLAGS_FILE),
+        );
+        candidates.push(parent.join(CLI_FLAGS_FILE));
+    }
+    candidates.extend(source_candidates);
+
+    if let Some(path) = candidates
+        .into_iter()
+        .find_map(|candidate| trusted_regular_file(&candidate))
     {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(BrokerRuntimeConfigError::CliFlagsConfigNotFound);
-    }
-
-    let cwd = std::env::current_dir().map_err(BrokerRuntimeConfigError::CurrentDir)?;
-    if let Some(path) = find_upward(&cwd, CLI_FLAGS_FILE) {
         return Ok(path);
-    }
-
-    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CLI_FLAGS_FILE);
-    if manifest_path.is_file() {
-        return Ok(manifest_path);
     }
 
     embedded_cli_flags_config_path()
 }
 
+fn validate_explicit_config(path: PathBuf) -> Result<PathBuf, BrokerRuntimeConfigError> {
+    if !path.is_absolute() {
+        return Err(BrokerRuntimeConfigError::ExplicitConfigMustBeAbsolute);
+    }
+    trusted_regular_file(&path).ok_or(BrokerRuntimeConfigError::ExplicitConfigUnreadable)
+}
+
+fn trusted_regular_file(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.metadata().ok()?.is_file() {
+        return None;
+    }
+    File::open(&canonical).ok()?;
+    Some(canonical)
+}
+
 fn embedded_cli_flags_config_path() -> Result<PathBuf, BrokerRuntimeConfigError> {
-    let path = std::env::temp_dir().join(format!("lmxd-cli-flags-{}.toml", std::process::id()));
-    fs::write(&path, EMBEDDED_CLI_FLAGS_TOML).map_err(|source| {
-        BrokerRuntimeConfigError::EmbeddedCliFlagsWrite {
-            path: path.clone(),
-            source,
+    if let Some(path) = EMBEDDED_CLI_FLAGS_PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let created = materialize_embedded_cli_flags_config()?;
+    let selected = EMBEDDED_CLI_FLAGS_PATH
+        .get_or_init(|| created.clone())
+        .clone();
+    if selected != created {
+        if let Some(parent) = created.parent() {
+            let _ = fs::remove_dir_all(parent);
         }
-    })?;
-    Ok(path)
+    }
+    Ok(selected)
+}
+
+fn materialize_embedded_cli_flags_config() -> Result<PathBuf, BrokerRuntimeConfigError> {
+    let base = std::env::temp_dir();
+    for _ in 0..64 {
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = EMBEDDED_CLI_FLAGS_NONCE.fetch_add(1, Ordering::Relaxed);
+        let directory = base.join(format!(
+            "live-mutex-mills-flags-{}-{clock:x}-{sequence:x}",
+            std::process::id()
+        ));
+
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(BrokerRuntimeConfigError::EmbeddedCliFlagsWrite {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+
+        #[cfg(unix)]
+        if let Err(source) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(BrokerRuntimeConfigError::EmbeddedCliFlagsWrite {
+                path: directory,
+                source,
+            });
+        }
+
+        let path = directory.join(CLI_FLAGS_FILE);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let result = (|| -> Result<(), std::io::Error> {
+            let mut file = options.open(&path)?;
+            file.write_all(EMBEDDED_CLI_FLAGS_TOML.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(source) = result {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(BrokerRuntimeConfigError::EmbeddedCliFlagsWrite {
+                path,
+                source,
+            });
+        }
+
+        return trusted_regular_file(&path).ok_or_else(|| {
+            let source = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "materialized contract is not a readable regular file",
+            );
+            BrokerRuntimeConfigError::EmbeddedCliFlagsWrite { path, source }
+        });
+    }
+
+    Err(BrokerRuntimeConfigError::EmbeddedCliFlagsWrite {
+        path: base,
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a controlled contract directory",
+        ),
+    })
 }
 
 fn cli_flags_config_from_args(args: &[String]) -> Result<Option<String>, BrokerRuntimeConfigError> {
@@ -388,6 +510,9 @@ fn cli_flags_config_from_args(args: &[String]) -> Result<Option<String>, BrokerR
             .or_else(|| arg.strip_prefix("--cli-flags="))
             .or_else(|| arg.strip_prefix("--cli-flags-config="))
         {
+            if path.trim().is_empty() {
+                return Err(BrokerRuntimeConfigError::InvalidConfigFlag(arg.clone()));
+            }
             return Ok(Some(path.to_string()));
         }
         if arg == "--config" || arg == "--cli-flags" || arg == "--cli-flags-config" {
@@ -436,19 +561,6 @@ fn strip_config_selector(
     Ok(stripped)
 }
 
-fn find_upward(start: &Path, filename: &str) -> Option<PathBuf> {
-    let mut dir = start.to_path_buf();
-    loop {
-        let candidate = dir.join(filename);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 fn parse_cli_overrides(
     config_path: &Path,
     args: &[String],
@@ -456,10 +568,9 @@ fn parse_cli_overrides(
     let config_c = cstring(config_path.to_string_lossy().as_ref())?;
     let audit_status = unsafe { f2e_audit_config_status_from_file(config_c.as_ptr()) };
     if audit_status != 0 {
-        let report = unsafe { take_owned_string(f2e_audit_config_from_file(config_c.as_ptr())) };
         return Err(BrokerRuntimeConfigError::CliFlagsConfigInvalid {
-            path: config_path.to_path_buf(),
-            report,
+            path: PathBuf::new(),
+            report: String::new(),
         });
     }
 
@@ -472,8 +583,10 @@ fn parse_cli_overrides(
             argv_c.as_ptr(),
         ))
     };
-    serde_json::from_str(&raw)
-        .map_err(|source| BrokerRuntimeConfigError::CliParserJson { raw, source })
+    serde_json::from_str(&raw).map_err(|source| BrokerRuntimeConfigError::CliParserJson {
+        raw: String::new(),
+        source,
+    })
 }
 
 fn render_help(config_path: &Path, command_name: &str) -> Result<String, BrokerRuntimeConfigError> {
@@ -520,8 +633,12 @@ fn take_json_list(
     env: &'static str,
 ) -> Result<Vec<String>, BrokerRuntimeConfigError> {
     match values.remove(env) {
-        Some(value) => serde_json::from_str(&value)
-            .map_err(|_| BrokerRuntimeConfigError::InvalidJsonList { env, value }),
+        Some(value) => serde_json::from_str(&value).map_err(|_| {
+            BrokerRuntimeConfigError::InvalidJsonList {
+                env,
+                value: String::new(),
+            }
+        }),
         None => Ok(Vec::new()),
     }
 }
@@ -615,9 +732,7 @@ fn validate_peer_addrs(addrs: &[String]) -> Result<(), BrokerRuntimeConfigError>
     for addr in addrs {
         validate_socketish_addr(ENV_PEER_ADDRS, addr)?;
         if !seen.insert(addr) {
-            return Err(BrokerRuntimeConfigError::InvalidPeerAddrs(format!(
-                "duplicate address {addr:?}"
-            )));
+            return Err(BrokerRuntimeConfigError::InvalidPeerAddrs(String::new()));
         }
     }
     Ok(())
@@ -643,19 +758,19 @@ fn validate_socketish_addr(env: &'static str, value: &str) -> Result<(), BrokerR
     {
         return Err(BrokerRuntimeConfigError::InvalidSocketAddr {
             env,
-            value: value.to_string(),
+            value: String::new(),
         });
     }
     let Some((host, port)) = value.rsplit_once(':') else {
         return Err(BrokerRuntimeConfigError::InvalidSocketAddr {
             env,
-            value: value.to_string(),
+            value: String::new(),
         });
     };
     if host.is_empty() || port.parse::<u16>().is_err() {
         return Err(BrokerRuntimeConfigError::InvalidSocketAddr {
             env,
-            value: value.to_string(),
+            value: String::new(),
         });
     }
     Ok(())
@@ -711,13 +826,11 @@ fn parse_demo(
         .unwrap_or_else(|| parse_csv_list(DEFAULT_DEMO_KEYS));
 
     if enabled && keys.is_empty() {
-        return Err(BrokerRuntimeConfigError::InvalidDemoKeys(
-            keys_raw.unwrap_or_default(),
-        ));
+        return Err(BrokerRuntimeConfigError::InvalidDemoKeys(String::new()));
     }
     if enabled {
         Composite::new(&keys)
-            .map_err(|err| BrokerRuntimeConfigError::InvalidDemoKeys(err.to_string()))?;
+            .map_err(|_| BrokerRuntimeConfigError::InvalidDemoKeys(String::new()))?;
     }
     let hold = Duration::from_millis(parse_u64_setting(
         cli,
@@ -762,7 +875,7 @@ fn parse_bool(env: &'static str, raw: &str) -> Result<bool, BrokerRuntimeConfigE
         "1" | "true" | "t" | "yes" | "on" => Ok(true),
         _ => Err(BrokerRuntimeConfigError::InvalidBool {
             env,
-            value: raw.to_string(),
+            value: String::new(),
         }),
     }
 }
@@ -782,7 +895,7 @@ fn parse_u64_setting(
         .parse::<u64>()
         .map_err(|_| BrokerRuntimeConfigError::InvalidNumber {
             env: key,
-            value: raw,
+            value: String::new(),
         })?;
     if value < min || value > max {
         return Err(BrokerRuntimeConfigError::NumberOutOfRange {
@@ -824,6 +937,35 @@ fn parse_csv_list(raw: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    const SOURCE: &str = include_str!("broker_runtime_config.rs");
+
+    struct TestTree(PathBuf);
+
+    impl TestTree {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "live-mutex-mills-runtime-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test tree");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
     }
@@ -833,6 +975,12 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    fn write_contract(path: &Path) {
+        fs::create_dir_all(path.parent().expect("contract parent"))
+            .expect("create contract parent");
+        fs::write(path, EMBEDDED_CLI_FLAGS_TOML).expect("write contract");
     }
 
     #[test]
@@ -940,10 +1088,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_flag_before_positionals_errors() {
+    fn unknown_flag_before_positionals_errors_without_echoing_values() {
+        let rejected = "postgres://runtime-secret@redacted.invalid/lmx";
         let err = BrokerRuntimeConfig::from_env_and_args(
             &HashMap::new(),
-            &args(&["lmxd", "--bogus", "0", "127.0.0.1:9100"]),
+            &args(&[
+                "lmxd",
+                &format!("--bogus={rejected}"),
+                "0",
+                "127.0.0.1:9100",
+            ]),
         )
         .unwrap_err();
 
@@ -951,6 +1105,9 @@ mod tests {
             err,
             BrokerRuntimeConfigError::UnknownCliOptions(_)
         ));
+        let display = err.to_string();
+        assert!(!display.contains(rejected));
+        assert!(!display.contains("runtime-secret"));
     }
 
     #[test]
@@ -1079,7 +1236,95 @@ mod tests {
     }
 
     #[test]
-    fn embedded_cli_flags_config_is_parseable() {
+    fn explicit_contract_requires_absolute_readable_regular_file() {
+        let tree = TestTree::new("explicit");
+        let reviewed = tree.path().join("operator/reviewed.toml");
+        write_contract(&reviewed);
+
+        let resolved = resolve_cli_flags_config_from(
+            Some(reviewed.clone()),
+            None,
+            Vec::new(),
+        )
+        .expect("explicit reviewed contract");
+        assert_eq!(resolved, reviewed.canonicalize().expect("canonical contract"));
+
+        let relative = resolve_cli_flags_config_from(
+            Some(PathBuf::from("runtime-secret.toml")),
+            None,
+            Vec::new(),
+        )
+        .expect_err("relative selector must fail closed");
+        assert!(matches!(
+            relative,
+            BrokerRuntimeConfigError::ExplicitConfigMustBeAbsolute
+        ));
+        assert!(!relative.to_string().contains("runtime-secret"));
+
+        let missing = tree.path().join("operator/missing-runtime-secret.toml");
+        let missing_error =
+            resolve_cli_flags_config_from(Some(missing.clone()), None, Vec::new())
+                .expect_err("missing selector must fail closed");
+        assert!(matches!(
+            missing_error,
+            BrokerRuntimeConfigError::ExplicitConfigUnreadable
+        ));
+        assert!(!missing_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+        assert!(!missing_error.to_string().contains("runtime-secret"));
+    }
+
+    #[test]
+    fn packaged_contract_beats_colocated_and_source_contracts() {
+        let tree = TestTree::new("package-order");
+        let executable = tree.path().join("install/bin/lmxd");
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create executable parent");
+        let packaged = tree
+            .path()
+            .join("install/share/live-mutex-mills/.cli-flags.toml");
+        let colocated = tree.path().join("install/bin/.cli-flags.toml");
+        let source = tree.path().join("source/.cli-flags.toml");
+        write_contract(&packaged);
+        write_contract(&colocated);
+        write_contract(&source);
+
+        let resolved = resolve_cli_flags_config_from(
+            None,
+            Some(executable),
+            vec![source],
+        )
+        .expect("trusted contract");
+        assert_eq!(
+            resolved,
+            packaged.canonicalize().expect("canonical packaged contract")
+        );
+    }
+
+    #[test]
+    fn unrelated_working_directory_contract_is_never_a_candidate() {
+        let tree = TestTree::new("hostile-cwd");
+        let hostile = tree.path().join("attacker/.cli-flags.toml");
+        let executable = tree.path().join("install/bin/lmxd");
+        let source = tree.path().join("source/.cli-flags.toml");
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create executable parent");
+        write_contract(&hostile);
+        write_contract(&source);
+
+        let resolved = resolve_cli_flags_config_from(
+            None,
+            Some(executable),
+            vec![source.clone()],
+        )
+        .expect("trusted source contract");
+        assert_ne!(resolved, hostile.canonicalize().expect("canonical hostile"));
+        assert_eq!(resolved, source.canonicalize().expect("canonical source"));
+    }
+
+    #[test]
+    fn embedded_cli_flags_config_is_parseable_and_controlled() {
         let path = embedded_cli_flags_config_path().unwrap();
         let parsed = parse_cli_overrides(
             &path,
@@ -1089,5 +1334,38 @@ mod tests {
 
         assert_eq!(parsed.get(ENV_CODEC).map(String::as_str), Some("json"));
         assert_eq!(parsed.get(ENV_STDIN).map(String::as_str), Some("false"));
+        assert_ne!(path.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(
+            fs::read_to_string(path).expect("embedded contract text"),
+            EMBEDDED_CLI_FLAGS_TOML
+        );
+    }
+
+    #[test]
+    fn malformed_parser_metadata_is_redacted() {
+        let rejected = "postgres://runtime-secret@redacted.invalid/lmx";
+        let mut overrides = HashMap::new();
+        overrides.insert(ENV_UNKNOWN_OPTIONS.to_string(), rejected.to_string());
+        let err = BrokerRuntimeConfig::reconcile(&HashMap::new(), overrides)
+            .expect_err("malformed metadata must fail");
+        assert!(matches!(
+            err,
+            BrokerRuntimeConfigError::InvalidJsonList { .. }
+        ));
+        assert!(!err.to_string().contains(rejected));
+        assert!(!err.to_string().contains("runtime-secret"));
+    }
+
+    #[test]
+    fn production_source_has_no_working_directory_contract_discovery() {
+        for forbidden in [
+            concat!("current_", "dir("),
+            concat!("find_", "upward("),
+        ] {
+            assert!(
+                !SOURCE.contains(forbidden),
+                "runtime config contains forbidden ambient discovery: {forbidden}"
+            );
+        }
     }
 }
