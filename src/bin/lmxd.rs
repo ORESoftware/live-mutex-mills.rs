@@ -223,6 +223,13 @@ fn main() {
         codec.as_str(),
         transport.quorum_policy
     );
+    tracing::info!(
+        node_id = id,
+        cluster_nodes = addrs.len(),
+        codec = codec.as_str(),
+        quorum = ?transport.quorum_policy,
+        "live-mutex-mills node starting"
+    );
     if demo_enabled {
         println!(
             "# demo enabled keys={} hold={}ms rest={}ms",
