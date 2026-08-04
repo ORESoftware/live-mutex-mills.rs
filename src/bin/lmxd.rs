@@ -223,12 +223,12 @@ fn main() {
         codec.as_str(),
         transport.quorum_policy
     );
-    if config.demo.enabled {
+    if demo_enabled {
         println!(
             "# demo enabled keys={} hold={}ms rest={}ms",
-            config.demo.keys.join(","),
-            config.demo.hold.as_millis(),
-            config.demo.rest.as_millis()
+            demo_keys.join(","),
+            demo_hold.as_millis(),
+            demo_rest.as_millis()
         );
     }
     if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
