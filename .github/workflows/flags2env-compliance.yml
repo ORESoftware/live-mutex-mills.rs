@@ -24,10 +24,10 @@ permissions:
 
 jobs:
   compliance:
-    uses: ORESoftware/flags-2-env/.github/workflows/reusable-consumer-compliance.yml@ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
+    uses: ORESoftware/flags-2-env/.github/workflows/reusable-consumer-compliance.yml@b596f2d1c99bd726b262a923916e3015bc80bc37
     with:
-      tooling_ref: ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
-      parser_ref: ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
+      tooling_ref: b596f2d1c99bd726b262a923916e3015bc80bc37
+      parser_ref: b596f2d1c99bd726b262a923916e3015bc80bc37
       kind: server
       command_name: lmxd
       contract_path: .cli-flags.toml
