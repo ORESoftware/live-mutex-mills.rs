@@ -1,0 +1,34 @@
+name: flags2env consumer compliance
+
+on:
+  pull_request:
+    paths:
+      - .cli-flags.toml
+      - build.rs
+      - vendor/flags2env/**
+      - src/broker_runtime_config.rs
+      - .github/scripts/flags2env-runtime-smoke.sh
+      - .github/workflows/flags2env-compliance.yml
+  push:
+    branches: [main]
+    paths:
+      - .cli-flags.toml
+      - build.rs
+      - vendor/flags2env/**
+      - src/broker_runtime_config.rs
+      - .github/scripts/flags2env-runtime-smoke.sh
+      - .github/workflows/flags2env-compliance.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compliance:
+    uses: ORESoftware/flags-2-env/.github/workflows/reusable-consumer-compliance.yml@ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
+    with:
+      tooling_ref: ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
+      parser_ref: ee9c2834d087663cdcec34fd3ad3d40c82ba9e1a
+      kind: server
+      command_name: lmxd
+      contract_path: .cli-flags.toml
+      runtime_smoke_script: .github/scripts/flags2env-runtime-smoke.sh
