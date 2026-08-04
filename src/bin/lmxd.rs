@@ -231,7 +231,7 @@ fn main() {
             config.demo.rest.as_millis()
         );
     }
-    if let Err(e) = run_node_with_settings(id, &addrs, cmd_rx, raw_evt_tx, transport) {
+    if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
         tracing::error!(error = %e, "node transport failed");
         eprintln!("node {id} failed: {e}");
         std::process::exit(1);
