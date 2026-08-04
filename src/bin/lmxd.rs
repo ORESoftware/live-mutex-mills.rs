@@ -38,6 +38,9 @@ fn main() {
         }
         Err(err) => {
             tracing::error!(error = %err, "invalid broker configuration");
+            // Keep the bounded, redacted configuration error directly visible
+            // even when the selected telemetry subscriber suppresses local logs.
+            eprintln!("invalid broker configuration: {err}");
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
@@ -220,15 +223,17 @@ fn main() {
         codec.as_str(),
         transport.quorum_policy
     );
-    tracing::info!(
-        node_id = id,
-        cluster_nodes = addrs.len(),
-        codec = codec.as_str(),
-        quorum = ?transport.quorum_policy,
-        "live-mutex-mills node starting"
-    );
-    if let Err(e) = run_node_with_settings(id, addrs, transport, cmd_rx, raw_evt_tx) {
-        tracing::error!(error = %e, "node failed");
+    if config.demo.enabled {
+        println!(
+            "# demo enabled keys={} hold={}ms rest={}ms",
+            config.demo.keys.join(","),
+            config.demo.hold.as_millis(),
+            config.demo.rest.as_millis()
+        );
+    }
+    if let Err(e) = run_node_with_settings(id, &addrs, cmd_rx, raw_evt_tx, transport) {
+        tracing::error!(error = %e, "node transport failed");
+        eprintln!("node {id} failed: {e}");
         std::process::exit(1);
     }
 }
